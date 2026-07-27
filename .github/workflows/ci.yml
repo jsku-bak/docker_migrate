@@ -1,0 +1,37 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  static-and-unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install static analysis tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+          go install mvdan.cc/sh/v3/cmd/shfmt@v3.10.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+      - name: Bash syntax
+        run: bash -n docker_migrate_perfect.sh tests/*.sh
+      - name: ShellCheck tracked scripts
+        run: shellcheck -S warning docker_migrate_perfect.sh tests/*.sh
+      - name: ShellCheck generated scripts
+        run: tests/lint-generated.sh
+      - name: Formatting
+        run: shfmt -d -i 2 -ci docker_migrate_perfect.sh tests/*.sh
+      - name: Unit tests
+        run: tests/run.sh
+
+  docker-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Docker integration test
+        run: tests/integration_docker.sh
