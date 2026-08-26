@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+### Bug fixes
+
+- Stop failing volume and bind restores over absolute symlinks such as `mysql.sock -> /var/run/mysqld/mysqld.sock`, a common runtime artifact in MySQL data volumes. Absolute links resolve inside the service container that mounts the volume and cannot escape to the host; they are now preserved with an informational log entry instead of silently aborting the whole restore transaction.
+- Print the offending link path and target when a relative symlink lexically escapes the mount root, instead of failing without any diagnostic.
+
 ## 2.0.0
 
 ### Reliability
