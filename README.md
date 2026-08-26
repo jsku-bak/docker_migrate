@@ -1,7 +1,3 @@
-# Docker Migrate
-
-[![自动化测试](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml/badge.svg)](https://github.com/lx969788249/docker_migrate/actions/workflows/ci.yml)
-
 ## Docker 迁移，最怕配置和数据没带全
 
 端口怎么映射的？环境变量改过哪些？数据卷和挂载目录有没有漏？容器里临时改过、却没有挂载出来的文件还能不能带走？
@@ -27,7 +23,7 @@ Docker Migrate 把这些事合成一条迁移流程：
 执行脚本：
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/master/docker_migrate_perfect.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/jsku-bak/docker_migrate/refs/heads/master/docker_migrate_perfect.sh)
 ```
 
 1. 在旧服务器选择 `1) 备份容器并传输`，选中要迁移的容器；
@@ -37,10 +33,14 @@ bash <(curl -fsSL https://raw.githubusercontent.com/lx969788249/docker_migrate/m
 
 > **警告：**迁移链接包含本次迁移包的解密密钥，请完整复制，千万不要公开。
 
-## 测试与反馈
+## 更新说明
 
-遇到问题请前往 [问题反馈](https://github.com/lx969788249/docker_migrate/issues)，并附上系统版本、Docker 版本和脚本最终输出的错误摘要。
+### 修复：MySQL 等数据卷恢复失败并整体回滚的问题
 
-如果这个项目对你有帮助，欢迎点亮star。
-
-仓库地址：[https://github.com/lx969788249/docker_migrate](https://github.com/lx969788249/docker_migrate)
+- **现象**：恢复时报 `回灌命名卷：mysql_data 失败`，随后整个恢复事务回滚，但备份包本身完整无损、手动解压也正常。
+- **原因**：MySQL、PostgreSQL 等服务会在数据卷里留下指向容器内绝对路径的运行时符号链接（如 `mysql.sock -> /var/run/mysqld/mysqld.sock`）。旧版恢复脚本的安全校验对绝对路径符号链接一律拒绝，且失败时不输出任何日志，导致整个迁移被静默误判失败。
+- **修复**：
+  - 绝对路径符号链接改为**放行并保留**（打印 `[INFO] 保留绝对符号链接` 日志）。这类链接只在挂载该卷的业务容器内解析，不会逃逸到宿主机，属于正常数据；
+  - 词法上越出挂载根的相对链接（如 `../../../etc`，典型路径穿越攻击）**仍然拒绝**，但失败时会打印 `[ERR]` 及具体链接路径和目标，不再静默失败；
+  - 集成测试新增回归用例：含 `mysql.sock` 绝对链接的卷归档、含绝对链接的 bind 归档均须恢复成功且链接原样保留。
+- **兼容性**：旧的迁移包**无需重新打包**。恢复端执行新脚本时，会用脚本内置的最新版 `restore.sh` 覆盖迁移包内的旧版本，旧包同样享受此修复。
