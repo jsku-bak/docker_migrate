@@ -2746,8 +2746,9 @@ archive_members_safe() {
   local archive="$1"
   local allowed_prefix="${2:-}"
   local entry
-  # 单次列出成员即可同时验证 gzip/tar 完整性和成员路径；安全链接仍在解压到
-  # 一次性容器后由 tree_links_stay_within_root 校验，保持现有链接支持语义。
+  # 单次列出成员即可同时验证 gzip/tar 完整性和成员路径；链接仍在解压到
+  # 一次性容器后由 tree_links_stay_within_root 校验：绝对链接放行并记录
+  # 日志，词法上越过挂载根的相对链接拒绝。
   tar -tzf "$archive" 2>/dev/null |
     while IFS= read -r entry; do
       entry="${entry#./}"
@@ -2763,15 +2764,23 @@ archive_members_safe() {
 tree_links_stay_within_root() {
   local mount_arg="$1"
   # 归档只在一次性容器中解压。即使 tar 先处理恶意链接，写入也只能逃到该
-  # 容器的临时根文件系统；随后再拒绝绝对链接和词法上越过挂载根的相对链接。
+  # 容器的临时根文件系统；随后再拒绝词法上越过挂载根的相对链接。
   # 合法的内部符号链接和硬链接都会保留。硬链接无法跨文件系统逃出挂载点。
+  # 绝对符号链接（如 mysql_data 卷内的 mysql.sock -> /var/run/mysqld/mysqld.sock）
+  # 是常见运行时产物：卷由业务容器挂载后在其自身文件系统内解析，不会逃逸
+  # 到宿主机。放行并记录日志，避免 MySQL 等服务的卷恢复被误判失败后整体回滚。
   docker run --rm -v "${mount_arg}:/tree:ro" alpine:3.20 sh -eu -c '
     find /tree -type l -exec sh -eu -c '\''
       root="$1"
       shift
       for link in "$@"; do
         target="$(readlink "$link")"
-        case "$target" in /*) exit 1 ;; esac
+        case "$target" in
+          /*)
+            printf "[INFO] 保留绝对符号链接：%s -> %s\n" "$link" "$target" >&2
+            continue
+            ;;
+        esac
         rel="${link#"${root}/"}"
         case "$rel" in
           */*) dir="${rel%/*}" ;;
@@ -2787,7 +2796,10 @@ tree_links_stay_within_root() {
             "" | .) ;;
             ..)
               depth=$((depth - 1))
-              [ "$depth" -ge 0 ] || exit 1
+              if [ "$depth" -lt 0 ]; then
+                printf "[ERR] 符号链接越出挂载根，拒绝恢复：%s -> %s\n" "$link" "$target" >&2
+                exit 1
+              fi
               ;;
             *) depth=$((depth + 1)) ;;
           esac
