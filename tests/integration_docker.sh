@@ -367,10 +367,14 @@ mkdir -p "${data_bundle}/volumes" "${data_bundle}/binds" "${data_bundle}/meta" \
   "${tmp}/volume-source" "$bind_target" "${bind_archive_root}${bind_target}"
 printf 'new-volume-data\n' >"${tmp}/volume-source/new.txt"
 ln -s new.txt "${tmp}/volume-source/safe-link"
+# MySQL 等服务会在数据卷里留下指向容器内绝对路径的运行时 socket 链接；
+# 恢复必须放行而不是判失败（回归：mysql.sock 曾导致整体回滚）。
+ln -s /var/run/mysqld/mysqld.sock "${tmp}/volume-source/mysql.sock"
 tar -czf "${data_bundle}/volumes/vol_${data_volume_name}.tgz" \
   -C "${tmp}/volume-source" .
 printf 'new-bind-data\n' >"${bind_archive_root}${bind_target}/new.txt"
 ln -s new.txt "${bind_archive_root}${bind_target}/safe-link"
+ln -s /etc/hostname "${bind_archive_root}${bind_target}/abs-link"
 tar -czf "${data_bundle}/binds/bind_test.tgz" -C "$bind_archive_root" "${bind_target#/}"
 printf 'old-bind-data\n' >"${bind_target}/old.txt"
 printf 'stale-bind-data\n' >"${bind_target}/stale.txt"
@@ -395,9 +399,10 @@ write_bundle_restore_script "${data_bundle}/restore.sh"
 generate_bundle_checksums "$data_bundle"
 (cd "$data_bundle" && bash restore.sh >/dev/null)
 docker run --rm -v "${data_volume_name}:/to:ro" alpine:3.20 sh -ec \
-  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt; test ! -e /to/old.txt; test ! -e /to/stale.txt'
+  'test "$(cat /to/new.txt)" = new-volume-data; test "$(readlink /to/safe-link)" = new.txt; test "$(readlink /to/mysql.sock)" = /var/run/mysqld/mysqld.sock; test ! -e /to/old.txt; test ! -e /to/stale.txt'
 [[ "$(cat "${bind_target}/new.txt")" == "new-bind-data" ]]
 [[ "$(readlink "${bind_target}/safe-link")" == "new.txt" ]]
+[[ "$(readlink "${bind_target}/abs-link")" == "/etc/hostname" ]]
 [[ ! -e "${bind_target}/old.txt" && ! -e "${bind_target}/stale.txt" ]]
 
 docker run --rm -v "${data_volume_name}:/to" alpine:3.20 sh -c 'printf stale >/to/stale.txt'
