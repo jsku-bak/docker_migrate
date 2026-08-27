@@ -35,6 +35,15 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jsku-bak/docker_migrate/refs
 
 ## 更新说明
 
+### 修复：迁移后 docker ps -a 与原服务器不一致的问题
+
+- **现象**：迁移后容器镜像列显示快照名（如 `docker-migrate-snapshot:xxx`）或镜像 ID，动态端口（如 32780-32782）漂移，容器排列顺序也与原服务器不同。
+- **修复**：
+  - 共享镜像组：从快照剥离顶层可写层重建干净的原始基础镜像，再通过 `docker cp` 注入各容器专属可写层，多个同镜像容器在 `docker ps` 中统一显示原始镜像名；
+  - 端口保留：备份时刷新 `NetworkSettings.Ports`，恢复时显式绑定源服务器实际使用的主机端口；
+  - 顺序一致：按容器创建时间排序恢复，`docker ps -a` 排列与源端一致；
+  - 快照镜像清理移至事务提交后，避免被回滚容器占用。
+
 ### 修复：MySQL 等数据卷恢复失败并整体回滚的问题
 
 - **现象**：恢复时报 `回灌命名卷：mysql_data 失败`，随后整个恢复事务回滚，但备份包本身完整无损、手动解压也正常。
@@ -44,3 +53,11 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jsku-bak/docker_migrate/refs
   - 词法上越出挂载根的相对链接（如 `../../../etc`，典型路径穿越攻击）**仍然拒绝**，但失败时会打印 `[ERR]` 及具体链接路径和目标，不再静默失败；
   - 集成测试新增回归用例：含 `mysql.sock` 绝对链接的卷归档、含绝对链接的 bind 归档均须恢复成功且链接原样保留。
 - **兼容性**：旧的迁移包**无需重新打包**。恢复端执行新脚本时，会用脚本内置的最新版 `restore.sh` 覆盖迁移包内的旧版本，旧包同样享受此修复。
+
+## 测试与反馈
+
+遇到问题请前往 [问题反馈](https://github.com/lx969788249/docker_migrate/issues)，并附上系统版本、Docker 版本和脚本最终输出的错误摘要。
+
+如果这个项目对你有帮助，欢迎点亮star。
+
+仓库地址：[https://github.com/lx969788249/docker_migrate](https://github.com/lx969788249/docker_migrate)

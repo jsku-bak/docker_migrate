@@ -1413,7 +1413,11 @@ decode_base64() {
 }
 
 name="$(jq -r '.[0].Name | ltrimstr("/")' "$META")"
-image="$(jq -r '.[0].Config.Image' "$META")"
+# 备份时 Config.Image 已被改写为快照镜像名；恢复必须优先读原始镜像名，
+# 保证 docker ps 的 IMAGE 列与源服务器一致（mysql:8.0 而非 docker-migrate-snapshot:...）。
+# 旧迁移包没有 DockerMigrate 字段时回退到 Config.Image。
+image="$(jq -r '.[0].DockerMigrate.original_image // .[0].Config.Image // empty' "$META")"
+snapshot_image="$(jq -r '.[0].DockerMigrate.snapshot_image // empty' "$META")"
 if [[ -z "$name" || -z "$image" || "$image" == "null" ]]; then
   echo "[WARN] invalid container metadata for __NAME__" >&2
   exit 1
@@ -1594,7 +1598,11 @@ fi
 
 original_running="$(jq -r '.[0].State.Running // false' "$META")"
 original_paused="$(jq -r '.[0].State.Paused // false' "$META")"
-if [[ "$original_running" == "true" ]]; then
+# 共享镜像组的非 donor 容器：统一镜像不含本容器可写层，先 create 容器，
+# docker cp 注入可写层后再 start（docker run -d 无法在创建与启动之间插入注入）。
+if [[ -n "${DM_WRITABLE_LAYER_TAR:-}" ]]; then
+  args=(docker create --name "$name")
+elif [[ "$original_running" == "true" ]]; then
   args=(docker run -d --name "$name")
 else
   args=(docker create --name "$name")
@@ -1777,42 +1785,96 @@ fi
 mapfile -t log_opts < <(jq -r '.[0].HostConfig.LogConfig.Config // {} | to_entries[]? | "\(.key)=\(.value)"' "$META")
 for o in "${log_opts[@]}"; do args+=(--log-opt "$o"); done
 
+# 关键修复：端口映射优先取 NetworkSettings.Ports（备份采集元数据时容器仍在
+# 运行，其中记录了 Docker 实际分配的宿主机端口，包括 -P / -p ::80 动态分配
+# 的端口，如 32780）。HostConfig.PortBindings 只保留"声明"：动态端口的
+# HostPort 为空或 "0"，直接按它恢复会让 Docker 重新随机分配端口，导致
+# docker ps 的 PORTS 列与源服务器不一致。
 publish_all="$(jq -r '.[0].HostConfig.PublishAllPorts // false' "$META")"
-if [[ "$publish_all" == "true" ]]; then
-  args+=(-P)
-fi
-
-# 关键修复：稳健还原 PortBindings。
-# 旧脚本在 HostPort 为空或 IPv6 HostIp 场景下容易生成无效 -p；这里跳过空 HostPort，并给 IPv6 加 []。
-mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as $c | .value[]? | "\(.HostIp // "")|\(.HostPort // "")|\($c)"' "$META")
 published_ports=()
-for p in "${port_bindings[@]}"; do
+declare -A runtime_v4_ports=()
+declare -A runtime_v6_ports=()
+mapfile -t runtime_ports < <(jq -r '
+  .[0].NetworkSettings.Ports // {} | to_entries[]
+  | select(.value != null) | .key as $c
+  | .value[] | select((.HostPort // "") != "")
+  | "\(.HostIp // "")|\(.HostPort)|\($c)"
+' "$META")
+for p in "${runtime_ports[@]}"; do
   host_ip="${p%%|*}"
   rest="${p#*|}"
   host_port="${rest%%|*}"
   cont_port="${rest#*|}"
-
-  # 空 HostPort 是 Docker 随机端口分配（如 -p 80 或 -p 0.0.0.0::80），保留空 HostPort 让 Docker 重新随机分配
-  [[ -z "$cont_port" ]] && continue
-
-  if [[ -z "$host_port" || "$host_port" == "null" ]]; then
-    # 随机端口：格式为 -p [ip::]containerPort[/proto]
-    host_port=""
+  [[ -n "$cont_port" ]] || continue
+  if [[ -z "$host_ip" || "$host_ip" == "0.0.0.0" ]]; then
+    runtime_v4_ports["${host_port}|${cont_port}"]=1
+  elif [[ "$host_ip" == "::" ]]; then
+    runtime_v6_ports["${host_port}|${cont_port}"]=1
   fi
-
-  if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
-    if [[ "$host_ip" == *:* ]]; then
-      port_binding="[${host_ip}]:${host_port}:${cont_port}"
+done
+for p in "${runtime_ports[@]}"; do
+  host_ip="${p%%|*}"
+  rest="${p#*|}"
+  host_port="${rest%%|*}"
+  cont_port="${rest#*|}"
+  [[ -n "$cont_port" ]] || continue
+  port_key="${host_port}|${cont_port}"
+  if [[ -z "$host_ip" || "$host_ip" == "0.0.0.0" ]]; then
+    # 同端口同时有 0.0.0.0 与 :: 两条记录时（Docker 双栈默认行为），
+    # 一条 -p host:cont 即可同时绑定 IPv4/IPv6；只有 0.0.0.0 时显式指定，
+    # 避免凭空多出 IPv6 绑定。
+    if [[ -n "${runtime_v6_ports[$port_key]:-}" ]]; then
+      port_binding="${host_port}:${cont_port}"
     else
-      port_binding="${host_ip}:${host_port}:${cont_port}"
+      port_binding="0.0.0.0:${host_port}:${cont_port}"
     fi
+  elif [[ "$host_ip" == "::" ]]; then
+    # 已由同端口的 0.0.0.0 条目合并发布，跳过
+    [[ -z "${runtime_v4_ports[$port_key]:-}" ]] || continue
+    port_binding="[::]:${host_port}:${cont_port}"
+  elif [[ "$host_ip" == *:* ]]; then
+    port_binding="[${host_ip}]:${host_port}:${cont_port}"
   else
-    port_binding="${host_port}:${cont_port}"
+    port_binding="${host_ip}:${host_port}:${cont_port}"
   fi
   args+=(-p "$port_binding")
   published_ports+=("$port_binding")
   echo "[INFO] restore port: ${host_ip:-0.0.0.0}:${host_port}->${cont_port}"
 done
+
+# 备份时已停止的容器没有运行时端口（NetworkSettings.Ports 为空），
+# 回退到 HostConfig.PortBindings 声明：静态端口照常还原；动态端口为空时
+# 让 Docker 重新分配（与源端 stop/start 行为一致，停止的容器 docker ps 不显示端口）。
+if ((${#runtime_ports[@]} == 0)); then
+  mapfile -t port_bindings < <(jq -r '.[0].HostConfig.PortBindings // {} | to_entries[]? | .key as $c | .value[]? | "\(.HostIp // "")|\(.HostPort // "")|\($c)"' "$META")
+  for p in "${port_bindings[@]}"; do
+    host_ip="${p%%|*}"
+    rest="${p#*|}"
+    host_port="${rest%%|*}"
+    cont_port="${rest#*|}"
+    [[ -n "$cont_port" ]] || continue
+    if [[ -z "$host_port" || "$host_port" == "null" ]]; then
+      # 随机端口：格式为 -p [ip::]containerPort[/proto]
+      host_port=""
+    fi
+    if [[ -n "$host_ip" && "$host_ip" != "0.0.0.0" ]]; then
+      if [[ "$host_ip" == *:* ]]; then
+        port_binding="[${host_ip}]:${host_port}:${cont_port}"
+      else
+        port_binding="${host_ip}:${host_port}:${cont_port}"
+      fi
+    else
+      port_binding="${host_port}:${cont_port}"
+    fi
+    args+=(-p "$port_binding")
+    published_ports+=("$port_binding")
+    echo "[INFO] restore port: ${host_ip:-0.0.0.0}:${host_port}->${cont_port}"
+  done
+  # 没有任何运行时端口时才用 -P（-P 会让 Docker 重新随机分配全部端口）
+  if [[ "$publish_all" == "true" ]]; then
+    args+=(-P)
+  fi
+fi
 
 mapfile -t mounts < <(jq -r '.[0].Mounts[]? | @base64' "$META")
 for m in "${mounts[@]}"; do
@@ -1867,6 +1929,24 @@ if [[ "$primary_net" != "bridge" && "$primary_net" != "host" &&
   done
 fi
 
+# 把快照镜像重新打回原始镜像名：容器仍由快照镜像（含原可写层）创建，
+# 但 docker ps 的 IMAGE 列显示原始镜像名，与源服务器保持一致。
+# 多个容器共享同一原始镜像名（如 3 个容器都用 xiaogongdan6:latest）时：
+# docker ps 的 IMAGE 列按镜像 ID 实时解析 tag，一个 tag 只能指向一个镜像
+# ID；共享组由恢复主脚本统一选 donor 快照 retag（DM_SHARED_IMAGE_BASE=1），
+# 本脚本不再改 tag——否则 tag 被最后一个容器抢走，其它容器会显示镜像 ID。
+if [[ "${DM_SHARED_IMAGE_BASE:-0}" == "1" ]]; then
+  echo "[INFO] 共享镜像组：镜像标签已由恢复主脚本统一设置：$image"
+elif [[ -n "$snapshot_image" && "$snapshot_image" != "$image" ]] &&
+  docker image inspect "$snapshot_image" >/dev/null 2>&1; then
+  if docker tag "$snapshot_image" "$image" >/dev/null 2>&1; then
+    echo "[INFO] 快照镜像已恢复原始名称：$snapshot_image -> $image"
+  else
+    echo "[WARN] 恢复镜像原始名称失败，改用快照镜像创建容器：$snapshot_image" >&2
+    image="$snapshot_image"
+  fi
+fi
+
 args+=("$image")
 if ((${#cmd_args[@]})); then
   args+=("${cmd_args[@]}")
@@ -1896,6 +1976,27 @@ if [[ $run_rc -ne 0 ]]; then
     echo "[INFO] 可执行 sudo ss -lntp 检查占用端口的进程。" >&2
   fi
   exit "$run_rc"
+fi
+
+# 共享镜像组成员：docker create 只包含统一基础镜像的文件系统，这里注入
+# 该容器在源端累积的可写层（docker cp 直接消费层 tar，保留 uid、权限、
+# 符号链接与硬链接；.wh. 白出条目已由恢复主脚本从 tar 中剥离）。
+if [[ -n "${DM_WRITABLE_LAYER_TAR:-}" ]]; then
+  if [[ ! -f "$DM_WRITABLE_LAYER_TAR" ]]; then
+    echo "[ERR] 共享镜像组可写层文件缺失：$DM_WRITABLE_LAYER_TAR" >&2
+    exit 1
+  fi
+  if ! docker cp - "$name:/" <"$DM_WRITABLE_LAYER_TAR"; then
+    echo "[ERR] 注入容器可写层失败：$name" >&2
+    exit 1
+  fi
+  echo "[INFO] 已注入容器可写层：$name"
+  if [[ "$original_running" == "true" ]]; then
+    if ! docker start "$name" >/dev/null; then
+      echo "[ERR] 可写层注入后启动容器失败：$name" >&2
+      exit 1
+    fi
+  fi
 fi
 
 # 连接额外网络。
@@ -1928,6 +2029,24 @@ if [[ "$network_mode" != "host" && "$network_mode" != "none" && "$network_mode" 
 fi
 if ((network_restore_failed == 1)); then
   exit 1
+fi
+
+# 共享镜像组成员：补执行白出条目对应的删除。docker cp 只能覆盖/新增文件，
+# 无法表达删除；源端容器删除过的文件在统一基础镜像里仍然存在，须在启动后
+# 用 docker exec 删除（源端非运行容器无 exec 时机，提示后跳过）。
+if [[ -n "${DM_WRITABLE_LAYER_TAR:-}" && -n "${DM_PENDING_DELETIONS:-}" ]]; then
+  if [[ "$original_running" == "true" ]]; then
+    while IFS= read -r dm_del_path; do
+      [[ -n "$dm_del_path" ]] || continue
+      if docker exec "$name" rm -rf -- "$dm_del_path" >/dev/null 2>&1; then
+        echo "[INFO] 已补删源端删除过的文件：$name:$dm_del_path"
+      else
+        echo "[WARN] 补删失败（文件可能本就不存在）：$name:$dm_del_path" >&2
+      fi
+    done <<<"$DM_PENDING_DELETIONS"
+  else
+    echo "[WARN] 源端处于停止状态的共享镜像组成员无法补删白出文件：$name" >&2
+  fi
 fi
 
 # 运行中的源容器必须通过启动验证，避免“docker run -d 成功但进程随即退出”后
@@ -4216,6 +4335,314 @@ else
   warn "images.tar 不存在，将按需在线拉取镜像。"
 fi
 
+# [A.2] 将快照镜像恢复为原始镜像名（Compose 路径）。
+# Compose 用本地镜像名创建容器；把快照 retag 回原始名并同步改写
+# _migration_images.yml 覆盖配置后，compose up 创建的容器在 docker ps 中
+# 显示原始镜像名（mysql:8.0），而非 docker-migrate-snapshot:...。
+# 多个容器共享同一原始镜像名时不能统一 retag（后一个快照会覆盖前一个的
+# 同名标签，导致其它容器拿到错误的可写层）：这种情况保留快照名，
+# 由单容器恢复路径逐个 retag+create 处理。
+RESTORE_STAGE="恢复镜像原始名称"
+declare -A DM_ORIG_IMAGE_USES=()
+for dm_meta in meta/*.inspect.json; do
+  [[ -f "$dm_meta" ]] || continue
+  dm_orig="$(jq -r '.[0].DockerMigrate.original_image // empty' "$dm_meta" 2>/dev/null || true)"
+  [[ -n "$dm_orig" ]] || continue
+  DM_ORIG_IMAGE_USES["$dm_orig"]=$(( ${DM_ORIG_IMAGE_USES["$dm_orig"]:-0} + 1 ))
+done
+for dm_meta in meta/*.inspect.json; do
+  [[ -f "$dm_meta" ]] || continue
+  dm_snap="$(jq -r '.[0].DockerMigrate.snapshot_image // empty' "$dm_meta" 2>/dev/null || true)"
+  dm_orig="$(jq -r '.[0].DockerMigrate.original_image // empty' "$dm_meta" 2>/dev/null || true)"
+  [[ -n "$dm_snap" && -n "$dm_orig" && "$dm_snap" != "$dm_orig" ]] || continue
+  docker image inspect "$dm_snap" >/dev/null 2>&1 || continue
+  (( ${DM_ORIG_IMAGE_USES["$dm_orig"]:-0} <= 1 )) || continue
+  docker tag "$dm_snap" "$dm_orig" >/dev/null 2>&1 || {
+    warn " 快照镜像 retag 失败：$dm_snap -> $dm_orig"
+    continue
+  }
+  echo " - 镜像原始名称已恢复：$dm_orig"
+  # Compose 项目：把覆盖配置里的快照镜像名改回原始镜像名。
+  dm_proj="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$dm_meta" 2>/dev/null || true)"
+  dm_svc="$(jq -r '.[0].Config.Labels["com.docker.compose.service"] // empty' "$dm_meta" 2>/dev/null || true)"
+  dm_override="compose/${dm_proj}/_migration_images.yml"
+  if [[ -n "$dm_proj" && -n "$dm_svc" && -f "$dm_override" ]]; then
+    dm_override_tmp="${dm_override}.tmp"
+    if jq --arg service "$dm_svc" --arg image "$dm_orig" '.services[$service].image = $image' \
+      "$dm_override" >"$dm_override_tmp" 2>/dev/null; then
+      mv "$dm_override_tmp" "$dm_override"
+    else
+      rm -f "$dm_override_tmp"
+    fi
+  fi
+done
+
+# [A.3] 共享镜像组：多个容器使用同一原始镜像名（如 3 个容器都用
+# xiaogongdan6:latest）。docker ps 的 IMAGE 列按容器镜像 ID 实时解析本地
+# tag，一个 tag 只能指向一个镜像 ID；若每个容器都从自己的快照镜像创建，
+# 只有一个容器能显示原始名，其余显示十六进制镜像 ID，与源服务器
+# docker ps 输出不一致。
+# 处理方式：从组内创建时间最早的成员快照重建“干净基础镜像”——按
+# docker save 清单去掉 commit 产生的顶层可写层（config 同步去掉对应的
+# diff_id 与 history 条目），重新打包 docker load 并 tag 为原始名。组内
+# 所有容器统一从该基础镜像 docker create，再用 docker cp 注入各自的
+# 可写层 tar（用 tar --delete 剥离 .wh. 白出条目，保留 uid、权限、符号
+# 链接与硬链接），白出对应的删除操作在容器启动后用 docker exec rm 补齐。
+# 这样每个容器的文件系统 = 基础镜像 + 自身可写层，与源服务器一致，且
+# docker ps 的 IMAGE 列全部显示原始镜像名。
+# 以下情况整组退回旧方式（各成员从自己的快照创建，只有一个容器能显示
+# 原始名，其余显示镜像 ID，数据保持正确）：无法读取 images.tar 清单、
+# 快照层信息异常、组内各成员的基础层不一致（同名 tag 曾在容器创建之间
+# 被更新过）、或重建镜像 docker load 失败。
+DM_SHARED_LAYERS_DIR=""
+declare -A DM_SHARED_LAYER_TAR=()
+declare -A DM_SHARED_DELETIONS=()
+declare -A DM_SHARED_GROUP_MEMBER=()
+declare -A DM_ORIG_IMAGE_SHARED=()
+if [[ -f images.tar ]] && compgen -G 'meta/*.inspect.json' >/dev/null &&
+  tar --help 2>&1 | grep -q -- '--delete'; then
+  declare -A DM_GROUP_MEMBERS=()
+  for dm_meta in meta/*.inspect.json; do
+    [[ -f "$dm_meta" ]] || continue
+    dm_orig="$(jq -r '.[0].DockerMigrate.original_image // empty' "$dm_meta" 2>/dev/null || true)"
+    dm_snap="$(jq -r '.[0].DockerMigrate.snapshot_image // empty' "$dm_meta" 2>/dev/null || true)"
+    [[ -n "$dm_orig" && -n "$dm_snap" && "$dm_snap" != "$dm_orig" ]] || continue
+    (( ${DM_ORIG_IMAGE_USES["$dm_orig"]:-0} > 1 )) || continue
+    # Compose 容器由 compose 路径恢复，不参与独立容器共享组
+    dm_proj="$(jq -r '.[0].Config.Labels["com.docker.compose.project"] // empty' "$dm_meta" 2>/dev/null || true)"
+    [[ -z "$dm_proj" ]] || continue
+    dm_cname="${dm_meta#meta/}"
+    dm_cname="${dm_cname%.inspect.json}"
+    dm_created="$(jq -r '.[0].Created // empty' "$dm_meta" 2>/dev/null || true)"
+    DM_GROUP_MEMBERS["$dm_orig"]+="${dm_created:-9999-12-31}"$'\t'"${dm_cname}"$'\t'"${dm_snap}"$'\n'
+    DM_ORIG_IMAGE_SHARED["$dm_cname"]=1
+  done
+  if ((${#DM_GROUP_MEMBERS[@]} > 0)); then
+    DM_SHARED_LAYERS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dm-shared-layers.XXXXXX")"
+    dm_img_manifest="${DM_SHARED_LAYERS_DIR}/manifest.json"
+    if ! tar -xOf images.tar manifest.json >"$dm_img_manifest" 2>/dev/null; then
+      rm -f "$dm_img_manifest"
+      warn "无法读取 images.tar 清单，共享镜像组退回逐容器快照创建。"
+    else
+      for dm_orig in "${!DM_GROUP_MEMBERS[@]}"; do
+        echo " - 共享镜像组：$dm_orig"
+        # 按创建时间从旧到新收集成员；最早的作为重建基础镜像的来源
+        dm_donor_name=""; dm_donor_snap=""
+        declare -a dm_names=() dm_snaps=()
+        while IFS=$'\t' read -r dm_created dm_cname dm_snap; do
+          [[ -n "$dm_cname" ]] || continue
+          if [[ -z "$dm_donor_snap" ]]; then
+            dm_donor_snap="$dm_snap"
+            dm_donor_name="$dm_cname"
+          fi
+          dm_names+=("$dm_cname")
+          dm_snaps+=("$dm_snap")
+        done < <(printf '%b' "${DM_GROUP_MEMBERS[$dm_orig]}" | LC_ALL=C sort)
+
+        # 读取各成员快照在镜像归档中的清单条目
+        declare -A DM_ENTRY=()
+        dm_all_found=1
+        for dm_i in "${!dm_snaps[@]}"; do
+          dm_entry="$(jq -c --arg tag "${dm_snaps[$dm_i]}" \
+            '[.[] | select((.RepoTags // []) | index($tag))][0]' \
+            "$dm_img_manifest" 2>/dev/null || true)"
+          if [[ -z "$dm_entry" || "$dm_entry" == "null" ]]; then
+            warn "  镜像归档缺少成员快照，整组退回逐容器快照创建：${dm_names[$dm_i]}"
+            dm_all_found=0
+            break
+          fi
+          DM_ENTRY["${dm_names[$dm_i]}"]="$dm_entry"
+        done
+        if ((dm_all_found != 1)); then
+          continue
+        fi
+
+        # 基础层一致性校验：同名 tag 在各容器创建之间被更新过则无法共享
+        dm_donor_layers_json="$(jq -c '.Layers[0:-1]' <<<"${DM_ENTRY[$dm_donor_name]}")"
+        dm_base_mismatch=0
+        for dm_i in "${!dm_names[@]}"; do
+          dm_m_layers="$(jq -c '.Layers[0:-1]' <<<"${DM_ENTRY[${dm_names[$dm_i]}]}")"
+          if [[ "$dm_m_layers" != "$dm_donor_layers_json" ]]; then
+            dm_base_mismatch=1
+            break
+          fi
+        done
+        if ((dm_base_mismatch == 1)); then
+          warn "  组内容器的基础镜像层不一致（同名 tag 曾被更新），退回逐容器快照创建。"
+          continue
+        fi
+
+        mapfile -t dm_base_layers < <(jq -r '.[]?' <<<"$dm_donor_layers_json")
+        dm_top_layer="$(jq -r '.Layers | last' <<<"${DM_ENTRY[$dm_donor_name]}")"
+        dm_cfg_path="$(jq -r '.Config // empty' <<<"${DM_ENTRY[$dm_donor_name]}")"
+        if (( ${#dm_base_layers[@]} == 0 )) ||
+          [[ -z "$dm_top_layer" || "$dm_top_layer" == "null" ]] ||
+          [[ -z "$dm_cfg_path" || "$dm_cfg_path" == "null" ]]; then
+          warn "  快照清单缺少层或配置信息，整组退回逐容器快照创建。"
+          continue
+        fi
+
+        # 一次性解出所需文件（donor 配置、基础层、各成员顶层可写层）
+        dm_unpack="${DM_SHARED_LAYERS_DIR}/unpack"
+        mkdir -p "$dm_unpack"
+        dm_need=(manifest.json "$dm_cfg_path" "${dm_base_layers[@]}")
+        for dm_i in "${!dm_names[@]}"; do
+          dm_need+=("$(jq -r '.Layers | last' <<<"${DM_ENTRY[${dm_names[$dm_i]}]}")")
+        done
+        # 旧版 docker save 格式的层目录还带 VERSION/json 元数据，一并解出
+        for dm_l in "${dm_base_layers[@]}"; do
+          if [[ "$dm_l" =~ ^[0-9a-f]{64}/layer\.tar$ ]]; then
+            dm_ld="$(dirname "$dm_l")"
+            dm_need+=("${dm_ld}/VERSION" "${dm_ld}/json")
+          fi
+        done
+        if ! tar -xf images.tar -C "$dm_unpack" "${dm_need[@]}" 2>/dev/null; then
+          warn "  解出镜像层失败，整组退回逐容器快照创建。"
+          continue
+        fi
+        dm_need_missing=0
+        for dm_p in "${dm_need[@]}"; do
+          if [[ ! -f "$dm_unpack/$dm_p" ]]; then
+            dm_need_missing=1
+            break
+          fi
+        done
+        if ((dm_need_missing == 1)); then
+          warn "  镜像归档缺少预期文件，整组退回逐容器快照创建。"
+          continue
+        fi
+
+        # 重建基础镜像：新 config 去掉最后一个 diff_id 与 history 条目
+        if ! jq -e '(.rootfs.diff_ids | length) >= 2' "$dm_unpack/$dm_cfg_path" >/dev/null 2>&1; then
+          warn "  快照配置异常（diff_ids 不足 2），整组退回逐容器快照创建。"
+          continue
+        fi
+        # 修正基础镜像 EXPOSE：donor 快照的 config 继承了容器运行时 -p 产生的
+        # ExposedPorts（如动态端口 9991），组内其他成员从基础镜像创建时会在
+        # docker ps 的 PORTS 列多出未映射端口。基础镜像的 EXPOSE 取
+        # 「各成员 ExposedPorts − 各自 PortBindings 键」的并集：镜像原生
+        # EXPOSE 且存在成员未绑定的端口保留展示，仅由运行时绑定产生的端口
+        # 不再出现（绑定端口本身仍会按映射展示，不受影响）。
+        dm_keep_expose=""
+        for dm_i in "${!dm_names[@]}"; do
+          while IFS= read -r dm_port; do
+            [[ -n "$dm_port" ]] || continue
+            if [[ "$dm_keep_expose" != *$'\n'"$dm_port"$'\n'* ]]; then
+              dm_keep_expose+="$dm_port"$'\n'
+            fi
+          done < <(jq -r '
+            . as $c |
+            ($c[0].Config.ExposedPorts // {}) | keys[] as $p |
+            select(($c[0].HostConfig.PortBindings // {}) | has($p) | not) |
+            $p
+          ' "meta/${dm_names[$dm_i]}.inspect.json" 2>/dev/null || true)
+        done
+        if [[ -n "$dm_keep_expose" ]]; then
+          dm_expose_json="$(printf '%s' "$dm_keep_expose" |
+            jq -R -s 'split("\n") | map(select(length > 0)) | reduce .[] as $p ({}; .[$p] = {})')"
+          dm_expose_filter='(.config.ExposedPorts = $dm_expose)'
+        else
+          dm_expose_json='{}'
+          dm_expose_filter='del(.config.ExposedPorts)'
+        fi
+        jq --argjson dm_expose "$dm_expose_json" \
+          "(.rootfs.diff_ids |= .[0:-1]) | (.history |= .[0:-1]) | $dm_expose_filter" \
+          "$dm_unpack/$dm_cfg_path" >"${DM_SHARED_LAYERS_DIR}/config.base.json"
+        dm_new_dig="$(sha256sum "${DM_SHARED_LAYERS_DIR}/config.base.json" | awk '{print $1}')"
+        case "$dm_cfg_path" in
+          *.json) dm_new_cfg="${dm_new_dig}.json" ;;
+          *) dm_new_cfg="$(dirname "$dm_cfg_path")/${dm_new_dig}" ;;
+        esac
+        mkdir -p "$dm_unpack/$(dirname "$dm_new_cfg")"
+        cp "${DM_SHARED_LAYERS_DIR}/config.base.json" "$dm_unpack/$dm_new_cfg"
+        jq --arg cfg "$dm_new_cfg" --arg tag "$dm_orig" --arg top "$dm_top_layer" '
+          .Config = $cfg
+          | .RepoTags = [$tag]
+          | .Layers |= .[0:-1]
+          | if has("LayerSources") then .LayerSources |= with_entries(select(.value != $top)) else . end
+          | [.]
+        ' <<<"${DM_ENTRY[$dm_donor_name]}" >"$dm_unpack/manifest.json"
+        dm_base_tar="${DM_SHARED_LAYERS_DIR}/base.tar"
+        dm_tar_list=(manifest.json "$dm_new_cfg" "${dm_base_layers[@]}")
+        for dm_l in "${dm_base_layers[@]}"; do
+          if [[ "$dm_l" =~ ^[0-9a-f]{64}/layer\.tar$ ]]; then
+            dm_tar_list+=("$(dirname "$dm_l")/VERSION" "$(dirname "$dm_l")/json")
+          fi
+        done
+        if ! (cd "$dm_unpack" && tar -cf "$dm_base_tar" "${dm_tar_list[@]}") 2>/dev/null; then
+          warn "  重新打包基础镜像失败，整组退回逐容器快照创建。"
+          continue
+        fi
+
+        # 各成员（含来源成员）准备可写层注入 tar：剥离 .wh. 白出条目。
+        # 任一成员准备失败则整组放弃共享方案：部分成功时，回退成员会在
+        # 自己的恢复脚本里把快照 retag 回原始名，覆盖基础镜像标签，
+        # 后续共享成员就会从含别人可写层的快照创建，数据错乱。
+        declare -A dm_group_tars=() dm_group_dels=()
+        dm_group_ok=1
+        for dm_i in "${!dm_names[@]}"; do
+          dm_cname="${dm_names[$dm_i]}"
+          dm_top="$(jq -r '.Layers | last' <<<"${DM_ENTRY[$dm_cname]}")"
+          dm_blob="$dm_unpack/$dm_top"
+          dm_wt="${DM_SHARED_LAYERS_DIR}/${dm_cname}.writable.tar"
+          if [[ "$(head -c 2 "$dm_blob" | od -An -tx1 | tr -d ' \n')" == "1f8b" ]]; then
+            if ! gzip -dc "$dm_blob" >"$dm_wt" 2>/dev/null; then
+              warn "  解压成员可写层失败：$dm_cname"
+              dm_group_ok=0
+              break
+            fi
+          else
+            cp "$dm_blob" "$dm_wt"
+          fi
+          # 收集白出条目并换算为容器内待删除路径
+          dm_dels=""
+          declare -a dm_wh=()
+          while IFS= read -r dm_member_name; do
+            [[ -n "$dm_member_name" ]] || continue
+            dm_wh+=("$dm_member_name")
+            dm_norm="${dm_member_name#./}"
+            dm_wd="$(dirname "$dm_norm")"
+            dm_wb="$(basename "$dm_norm")"
+            if [[ "$dm_wb" == ".wh..wh..opq" ]]; then
+              warn "  可写层含目录整体清空记录（opaque whiteout），该目录保留基础镜像内容：$dm_cname:$dm_wd"
+              continue
+            fi
+            if [[ "$dm_wd" == "." ]]; then
+              dm_dels+="/${dm_wb#.wh.}"$'\n'
+            else
+              dm_dels+="/${dm_wd}/${dm_wb#.wh.}"$'\n'
+            fi
+          done < <(tar -tf "$dm_wt" 2>/dev/null | grep -E '(^|/)\.wh\.' || true)
+          if ((${#dm_wh[@]} > 0)); then
+            if ! tar --delete -f "$dm_wt" "${dm_wh[@]}" 2>/dev/null; then
+              warn "  剥离白出条目失败：$dm_cname"
+              dm_group_ok=0
+              break
+            fi
+          fi
+          dm_group_tars["$dm_cname"]="$dm_wt"
+          dm_group_dels["$dm_cname"]="$dm_dels"
+          echo "  成员可写层已准备：$dm_cname"
+        done
+        if ((dm_group_ok != 1)); then
+          warn "  组内存在准备失败的成员，整组退回逐容器快照创建：$dm_orig"
+          continue
+        fi
+        if ! docker load -i "$dm_base_tar" >/dev/null 2>&1; then
+          warn "  重建基础镜像 docker load 失败，整组退回逐容器快照创建：$dm_orig"
+          continue
+        fi
+        echo "  已重建基础镜像并恢复原始名称：$dm_orig（来源：$dm_donor_name 的快照）"
+        for dm_cname in "${!dm_group_tars[@]}"; do
+          DM_SHARED_LAYER_TAR["$dm_cname"]="${dm_group_tars[$dm_cname]}"
+          DM_SHARED_DELETIONS["$dm_cname"]="${dm_group_dels[$dm_cname]}"
+          DM_SHARED_GROUP_MEMBER["$dm_cname"]=1
+        done
+      done
+    fi
+  fi
+fi
+
 RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
@@ -4459,6 +4886,9 @@ fi
 RESTORE_STAGE="恢复独立容器"
 say "[F] 恢复单容器（非 Compose）"
 if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
+  # 按源端容器创建时间从旧到新排序恢复：docker ps -a 按创建时间倒序显示，
+  # 与源端一致的创建顺序才能得到与源服务器完全一致的 docker ps -a 输出。
+  # （runs 在 manifest 中的顺序是备份时的选择顺序，可能恰好相反。）
   while IFS= read -r r; do
     [[ -n "$r" ]] || continue
     cname_from_script="${r#runs/}"
@@ -4468,13 +4898,31 @@ if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
       continue
     fi
     echo " - $r"
-    if ! RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r" 2>&1; then
+    dm_run_rc=0
+    if [[ -n "${DM_SHARED_GROUP_MEMBER[$cname_from_script]:-}" ]]; then
+      echo "   共享镜像组成员：统一基础镜像 + 可写层注入"
+      DM_WRITABLE_LAYER_TAR="${DM_SHARED_LAYER_TAR[$cname_from_script]:-}" \
+        DM_PENDING_DELETIONS="${DM_SHARED_DELETIONS[$cname_from_script]:-}" \
+        DM_SHARED_IMAGE_BASE=1 \
+        RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r" 2>&1 || dm_run_rc=$?
+    else
+      RESTORE_TRANSACTION_DIR="$RESTORE_TRANSACTION_DIR" bash "$r" 2>&1 || dm_run_rc=$?
+    fi
+    if ((dm_run_rc != 0)); then
       warn " 容器恢复脚本失败：$r"
       FAILED_CONTAINERS+=("$cname_from_script")
       print_failure_summary
       exit 1
     fi
-  done < <(jq -r '.runs[]' manifest.json)
+  done < <(
+    while IFS= read -r r; do
+      [[ -n "$r" ]] || continue
+      cname_for_order="${r#runs/}"
+      cname_for_order="${cname_for_order%.sh}"
+      created="$(jq -r '.[0].Created // empty' "meta/${cname_for_order}.inspect.json" 2>/dev/null || true)"
+      printf '%s\t%s\n' "${created:-0000-00-00T00:00:00Z}" "$r"
+    done < <(jq -r '.runs[]' manifest.json) | LC_ALL=C sort | cut -f2-
+  )
 fi
 
 if restore_has_failures; then
@@ -4483,6 +4931,24 @@ if restore_has_failures; then
 fi
 
 transaction_commit
+
+# [F.1] 清理快照镜像标签：所有容器已按原始镜像名创建，快照镜像
+# （docker-migrate-snapshot:...）只是迁移中间产物。唯一镜像场景下快照与
+# 原始名指向同一镜像 ID，rmi 仅解除快照标签；共享镜像组场景下容器全部
+# 指向重建的基础镜像，快照镜像整体删除。必须在 transaction_commit 之后
+# 执行：commit 前旧容器（回滚备份）仍引用快照镜像，rmi 会被拒绝。
+# 清理失败不影响已恢复容器。
+for dm_meta in meta/*.inspect.json; do
+  [[ -f "$dm_meta" ]] || continue
+  dm_snap="$(jq -r '.[0].DockerMigrate.snapshot_image // empty' "$dm_meta" 2>/dev/null || true)"
+  [[ -n "$dm_snap" ]] || continue
+  docker image inspect "$dm_snap" >/dev/null 2>&1 || continue
+  if docker rmi "$dm_snap" >/dev/null 2>&1; then
+    echo " - 已清理快照镜像标签：$dm_snap"
+  else
+    warn " 快照镜像标签清理失败（不影响已恢复容器）：$dm_snap"
+  fi
+done
 REST_SH
   chmod +x "$out"
 }
@@ -4804,6 +5270,18 @@ restore_main() {
 
   # 使用当前脚本内置的修复版 restore.sh 覆盖包内旧 restore.sh。
   write_bundle_restore_script "${BUNDLE_DIR}/restore.sh"
+
+  # 同样用当前脚本内置的修复版单容器恢复脚本覆盖包内旧 runs/*.sh。
+  # runs/*.sh 在备份时生成，不会随 restore.sh 一起更新；不覆盖的话，
+  # 旧迁移包无法享受镜像名还原、端口精确保留等修复。
+  local run_entry run_cname
+  while IFS= read -r run_entry; do
+    [[ -n "$run_entry" ]] || continue
+    run_cname="${run_entry#runs/}"
+    run_cname="${run_cname%.sh}"
+    [[ -f "${BUNDLE_DIR}/meta/${run_cname}.inspect.json" ]] || continue
+    write_run_script "$run_cname" "${BUNDLE_DIR}/${run_entry}"
+  done < <(jq -r '.runs[]' "${BUNDLE_DIR}/manifest.json" 2>/dev/null || true)
 
   local rc result_file="${SESSION_DIR}/restore-result.json" result_status result_stage rollback_dir
   local metrics total running paused stopped missing volumes binds
@@ -5940,6 +6418,31 @@ if ((SOURCE_RESTORE_EXPECTED > 0)); then
     exit 1
   fi
 fi
+
+# 刷新元数据中的运行时端口：使用动态端口（-p 9991 未指定宿主端口）的容器
+# 在 stop/start 后会被 Docker 重新分配端口（如 32777→32780）。元数据采集
+# 发生在停机前，记录的是旧端口；用户之后在源服务器 docker ps 看到的是
+# 重启后的新端口。若不刷新，恢复出的容器端口与源服务器当前状态不一致。
+# 用重启后的实际端口改写 NetworkSettings.Ports，使新服务器 docker ps -a
+# 与源服务器完全一致（本段在生成 run 脚本与校验清单之前执行，都会使用新值）。
+for id in "${IDS[@]}"; do
+  n="${CONTAINER_NAME[$id]}"
+  dm_meta_ports_file="${BUNDLE}/meta/${n}.inspect.json"
+  [[ -f "$dm_meta_ports_file" ]] || continue
+  # 未运行的容器（备份前就已停止）保留停机前端口记录
+  [[ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null || echo false)" == "true" ]] || continue
+  dm_live_ports="$(docker inspect "$id" 2>/dev/null | jq -c '.[0].NetworkSettings.Ports // {}' 2>/dev/null || true)"
+  [[ -n "$dm_live_ports" && "$dm_live_ports" != "null" ]] || continue
+  dm_meta_ports_tmp="${dm_meta_ports_file}.ports.tmp"
+  if jq --argjson ports "$dm_live_ports" '.[0].NetworkSettings.Ports = $ports' \
+    "$dm_meta_ports_file" >"$dm_meta_ports_tmp" 2>/dev/null; then
+    mv "$dm_meta_ports_tmp" "$dm_meta_ports_file"
+    echo "[INFO] 已刷新运行时端口元数据：$n"
+  else
+    rm -f "$dm_meta_ports_tmp"
+    YEL "[WARN] 刷新运行时端口元数据失败（保留停机前记录）：$n"
+  fi
+done
 
 #####################################
 # 生成独立容器 run 脚本
