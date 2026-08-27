@@ -4545,8 +4545,14 @@ if [[ -f images.tar ]] && compgen -G 'meta/*.inspect.json' >/dev/null &&
           dm_expose_json='{}'
           dm_expose_filter='del(.config.ExposedPorts)'
         fi
+        # 清除 donor 快照从容器继承的 Labels：docker commit 会把 donor 容器的
+        # 标签（如 traefik.* 路由标签）固化进快照 config。若不从基础镜像中
+        # 剥离，组内所有成员创建时都会合并继承这些标签，反向代理（如
+        # Traefik）会把每个成员注册到 donor 的路由/服务名下，导致路由冲突、
+        # 服务后端串台与证书申请失败。容器自身的标签在恢复脚本创建容器时
+        # 会按元数据逐条 --label 重新应用，不受影响。
         jq --argjson dm_expose "$dm_expose_json" \
-          "(.rootfs.diff_ids |= .[0:-1]) | (.history |= .[0:-1]) | $dm_expose_filter" \
+          "(.rootfs.diff_ids |= .[0:-1]) | (.history |= .[0:-1]) | $dm_expose_filter | del(.config.Labels)" \
           "$dm_unpack/$dm_cfg_path" >"${DM_SHARED_LAYERS_DIR}/config.base.json"
         dm_new_dig="$(sha256sum "${DM_SHARED_LAYERS_DIR}/config.base.json" | awk '{print $1}')"
         case "$dm_cfg_path" in
