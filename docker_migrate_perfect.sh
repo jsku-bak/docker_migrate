@@ -1736,7 +1736,7 @@ elif [[ "$hc_kind" == "CMD" || "$hc_kind" == "CMD-SHELL" ]]; then
   args+=(--health-timeout "${hc_timeout}ns")
   args+=(--health-retries "$hc_retries")
   [[ "$hc_start_period" != "0" ]] && args+=(--health-start-period "${hc_start_period}ns")
-  if [[ "$hc_start_interval" != "0" ]] && docker run --help 2>/dev/null | grep -q -- '--health-start-interval'; then
+  if [[ "$hc_start_interval" != "0" ]] && [[ "$(docker run --help 2>/dev/null || true)" == *--health-start-interval* ]]; then
     args+=(--health-start-interval "${hc_start_interval}ns")
   fi
 fi
@@ -4400,7 +4400,7 @@ declare -A DM_SHARED_DELETIONS=()
 declare -A DM_SHARED_GROUP_MEMBER=()
 declare -A DM_ORIG_IMAGE_SHARED=()
 if [[ -f images.tar ]] && compgen -G 'meta/*.inspect.json' >/dev/null &&
-  tar --help 2>&1 | grep -q -- '--delete'; then
+  [[ "$(tar --help 2>&1 || true)" == *--delete* ]]; then
   declare -A DM_GROUP_MEMBERS=()
   for dm_meta in meta/*.inspect.json; do
     [[ -f "$dm_meta" ]] || continue
