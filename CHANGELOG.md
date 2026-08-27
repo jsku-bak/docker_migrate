@@ -4,6 +4,8 @@
 
 ### Bug fixes
 
+- Bundle the volume-tool image `alpine:3.20` (~3.5 MB) into `images.tar` during backup so the restore side gets it via `docker load` and never needs `docker pull`. Servers that intentionally keep an old environment can ship an `unpigz` built against zlib < 1.2.3, which makes every `docker pull` fail at layer extraction (`failed to register layer: unpigz: abort`) while `docker load` keeps working; the migration is now immune to this and fully offline-capable.
+- When the tool image is still missing (old bundles on such servers), print actionable guidance (remove or upgrade `pigz`, or re-create the bundle with the new script) before aborting before any data is touched.
 - Stop failing volume and bind restores over absolute symlinks such as `mysql.sock -> /var/run/mysqld/mysqld.sock`, a common runtime artifact in MySQL data volumes. Absolute links resolve inside the service container that mounts the volume and cannot escape to the host; they are now preserved with an informational log entry instead of silently aborting the whole restore transaction.
 - Print the offending link path and target when a relative symlink lexically escapes the mount root, instead of failing without any diagnostic.
 

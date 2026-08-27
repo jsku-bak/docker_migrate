@@ -4647,8 +4647,16 @@ RESTORE_STAGE="建立统一回滚事务"
 say "[A.1] 建立目标端服务与数据统一回滚事务"
 if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/null &&
   ! docker image inspect alpine:3.20 >/dev/null 2>&1; then
+  # 新版迁移包已把 alpine:3.20 打进 images.tar 并在 [A] 阶段加载（离线可用）；
+  # 走到这里说明是旧版迁移包且目标端本地没有该镜像，只能在线拉取。
   dm_run_with_activity "拉取卷操作镜像 alpine:3.20" docker pull alpine:3.20 || {
     warn "无法准备 alpine:3.20；为避免在无回滚能力时修改数据，恢复终止。"
+    warn "常见原因：本机安装了旧版 pigz/unpigz（zlib<1.2.3），导致 docker pull 解层失败"
+    warn "（报 \"failed to register layer\" 或 \"unpigz: abort\"），而 docker load 不受影响。"
+    warn "解决办法（任选其一）："
+    warn "  1) apt-get remove -y pigz && systemctl restart docker   # 移除后 Docker 回退内置 gzip"
+    warn "  2) apt-get update && apt-get install --only-upgrade pigz && systemctl restart docker"
+    warn "  3) 用新版脚本重新生成迁移包（alpine:3.20 已内置于 images.tar，恢复全程无需联网）"
     exit 1
   }
 fi
@@ -6464,6 +6472,16 @@ fi
 # 保存镜像 images.tar
 #####################################
 mapfile -t IMAGES < <(printf "%s\n" "${!IMGSET[@]}" | awk 'NF' | sort -u)
+# 把卷操作镜像 alpine:3.20 一并打进镜像归档（约 3.5MB）：恢复端 docker load
+# 即可得到，无需 docker pull。部分刻意保持旧环境的同步备份服务器上，旧版
+# unpigz（zlib<1.2.3）会让 docker pull 的解层步骤失败（报 "failed to
+# register layer"），而 docker load 的导入路径不受影响；打包后恢复端同时
+# 具备完全离线恢复能力。
+if docker image inspect alpine:3.20 >/dev/null 2>&1; then
+  if ! printf '%s\n' "${IMAGES[@]}" | grep -qxF 'alpine:3.20'; then
+    IMAGES+=("alpine:3.20")
+  fi
+fi
 if ((${#IMAGES[@]})); then
   OUT_IMG="${BUNDLE}/images.tar"
   if progress_docker_save "${OUT_IMG}" docker image save "${IMAGES[@]}"; then

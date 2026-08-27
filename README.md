@@ -35,6 +35,13 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jsku-bak/docker_migrate/refs
 
 ## 更新说明
 
+### 修复：旧环境服务器上恢复失败（unpigz/zlib 版本过旧）的问题
+
+- **现象**：恢复到刻意保持旧环境的服务器时，报 `failed to register layer: exit status 22: unpigz: abort: zlib version less than 1.2.3`，拉取卷操作镜像 `alpine:3.20` 失败，恢复在建立回滚事务前安全终止（数据未被修改）。
+- **原因**：这类服务器上的 `pigz/unpigz` 是针对 zlib < 1.2.3 编译的旧版本，Docker 在 `docker pull` 的解层步骤会调用它并直接报错；而 `docker load` 的镜像导入路径不受影响。
+- **修复**：备份时把卷操作镜像 `alpine:3.20`（约 3.5MB）一并打进 `images.tar`，恢复端通过 `docker load` 直接获得，**全程无需 `docker pull`**——同时让恢复具备完全离线能力。已在真实故障环境（unpigz 报错的服务器）端到端验证：3 容器迁移恢复成功，`docker ps -a` 与源端一致。
+- **旧迁移包兼容**：旧包内没有内置 alpine，若目标端本地也没有且 pull 失败，脚本会给出可操作的解决办法（移除/升级 pigz，或用新版脚本重新生成迁移包）后再终止。
+
 ### 修复：迁移后 docker ps -a 与原服务器不一致的问题
 
 - **现象**：迁移后容器镜像列显示快照名（如 `docker-migrate-snapshot:xxx`）或镜像 ID，动态端口（如 32780-32782）漂移，容器排列顺序也与原服务器不同。
