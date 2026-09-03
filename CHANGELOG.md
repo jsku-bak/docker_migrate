@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+### New features
+
+- Support hybrid "Docker data plane + host management plane" applications, beginning with BT Cloud WAF (bt-cloudwaf). Backup now detects `cloudwaf_*` containers among the selection and packs the host-side management components (`/www/cloud_waf` with container-mounted subdirectories excluded to avoid double packing, `/etc/init.d/btw`, the `/usr/bin/btw` symlink, and any `btw.service` systemd unit) into a new `hostside/` bundle section, recording them under `hostside` in `manifest.json`. The panel is quiesced with `btw admin_stop` before archiving its SQLite state and restarted after the data-plane containers come back, so the source server's running state is preserved.
+
+- Restore the host-side components in a new `[B0]` stage before bind mounts are replayed, reusing the `restore_bind_exact` transaction (same-filesystem move, one-shot alpine extraction, WAL rollback). A new `[G]` stage then brings the management plane up on the target: installs missing runtime dependencies (`ipset`, without which the CloudWaf panel silently fails to bind its port), rewrites the source server IP in panel configs (`serverip.json`, `iplist.txt`) to the new server IP (explicit `RESTORE_HOSTSIDE_IP` wins over public-IP detection), registers the systemd unit, starts the service idempotently, and waits for the admin port to listen before printing the new admin URL. The panel only accepts TLS 1.3, so the health probe retries with `--tlsv1.3` and treats "port listening but local curl got no response" as a warning rather than a restore failure, since restore hosts with an older curl/OpenSSL cannot negotiate TLS 1.3 at all and would otherwise trigger a spurious full rollback. On rollback, the management processes are killed before file rollback so open file handles cannot keep writing into restored paths.
+
 ### Bug fixes
 
 - Fix `docker: Error response from daemon: invalid mode: ro,ro` when recreating containers whose bind mounts are read-only (e.g. `-v /etc/localtime:/etc/localtime:ro`). `Mounts[].Mode` already carries `ro` for such mounts and the generator appended another `ro` based on `RW=false`, producing an invalid doubled mode. The `ro` flag is now appended only when not already present in the mount options.

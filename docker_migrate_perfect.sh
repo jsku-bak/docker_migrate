@@ -10,6 +10,10 @@
 # 3. 打包：镜像、命名卷、绑定目录、（可用的）Compose 配置
 # 4. 生成 manifest.json 和 restore.sh
 # 5. 加密迁移包后启动带安全随机路径的 HTTP 服务；退出时关闭 HTTP、重启停机容器、清理临时文件
+# 6. 混合架构支持（宝塔云WAF）：检测 cloudwaf_* 数据面容器时，把宿主机
+#    管理组件（/www/cloud_waf 面板与配置、/etc/init.d/btw、/usr/bin/btw、
+#    systemd 单元）一并打包；恢复端安装组件、改写面板 IP（serverip.json/
+#    iplist.txt）、补装 ipset 依赖并启动验证管理端，全程纳入事务回滚。
 #
 # 本版修复：
 # - 恢复时同名容器已存在但端口绑定不同，会删除并重建容器，避免“恢复成功但端口丢失”。
@@ -24,7 +28,9 @@
 # RESTORE_CLEAN_ALL=1   恢复失败也强制清理文件
 # RESTORE_BASE=/path    新服务器恢复目录
 # RESTORE_ROLLBACK_BASE=/path 失败回滚后需保留的 Compose 配置目录（默认 ~/.docker_migrate_rollback）
-#
+# RESTORE_HOSTSIDE_IP=IP 恢复混合架构（宝塔云WAF）时面板配置改写用的新服务器
+#                       公网 IP（默认自动探测；探测失败时必须显式指定）
+
 # 参数：
 # --no-stop             不停机备份（可能不一致，数据库慎用）
 # --include=name1,name2 按容器名称精确匹配，只迁移指定容器（不使用分组菜单）
@@ -39,7 +45,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -2301,6 +2307,7 @@ FAILED_BINDS=()
 FAILED_NETWORKS=()
 FAILED_PROJECTS=()
 FAILED_CONTAINERS=()
+FAILED_HOSTSIDE=()
 declare -A SKIP_PROJECTS=()
 declare -A SKIP_CONTAINERS=()
 declare -A SELECTED_TRANSACTION_VOLUMES=()
@@ -2472,7 +2479,8 @@ restore_has_failures() {
      ${#FAILED_BINDS[@]} > 0 ||
      ${#FAILED_NETWORKS[@]} > 0 ||
      ${#FAILED_PROJECTS[@]} > 0 ||
-     ${#FAILED_CONTAINERS[@]} > 0 ))
+     ${#FAILED_CONTAINERS[@]} > 0 ||
+     ${#FAILED_HOSTSIDE[@]} > 0 ))
 }
 
 print_failure_summary() {
@@ -2483,6 +2491,11 @@ print_failure_summary() {
   ((${#FAILED_BINDS[@]} == 0)) || warn "  · 绑定目录失败: ${FAILED_BINDS[*]}"
   ((${#FAILED_NETWORKS[@]} == 0)) || warn "  · 自定义网络失败: ${FAILED_NETWORKS[*]}"
   ((${#FAILED_PROJECTS[@]} == 0)) || warn "  · Compose 项目失败: ${FAILED_PROJECTS[*]}"
+  if ((${#FAILED_HOSTSIDE[@]} > 0)); then
+    warn "  · 宿主机管理组件失败: ${FAILED_HOSTSIDE[*]}"
+    warn "  常见原因：目标端 8379 管理端口被占用、ipset 等依赖缺失。"
+    warn "  可用命令排查端口：ss -lntp | grep 8379；面板日志：/www/cloud_waf/console/logs/error.log"
+  fi
   if ((${#FAILED_CONTAINERS[@]} > 0)); then
     warn "  · 独立容器失败: ${FAILED_CONTAINERS[*]}"
     warn "  常见原因：端口冲突、镜像缺失、网络配置不兼容。"
@@ -2855,6 +2868,29 @@ restore_manifest_is_safe() {
         (test("(^|/)\\.\\.(/|$)") | not) and
         all(explode[]; . >= 32 and . != 127)) and
       (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+    ) and
+    ((.hostside // {}) | type == "object") and
+    ((.hostside.paths // []) | type == "array") and
+    all((.hostside.paths // [])[];
+      (.host | type == "string" and startswith("/") and . != "/" and
+        (test("(^|/)\\.\\.(/|$)") | not) and
+        all(explode[]; . >= 32 and . != 127)) and
+      (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
+    ) and
+    ((.hostside.services // []) | type == "array") and
+    all((.hostside.services // [])[];
+      (.init // "" | test("^/etc/init\\.d/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      (.start_arg // "start" | test("^[A-Za-z0-9_-]+$")) and
+      ((.units // []) | type == "array") and
+      all(.units[]?; test("^/(usr/lib|etc)/systemd/system/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      ((.process_patterns // []) | type == "array" and all(.[]; type == "string")) and
+      ((.deps // []) | type == "array" and all(.[]; test("^[A-Za-z0-9][A-Za-z0-9_.+-]*$"))) and
+      ((.ip_rewrite_files // []) | type == "array" and
+        all(.[]; type == "string" and startswith("/") and
+          (test("(^|/)\\.\\.(/|$)") | not) and
+          all(explode[]; . >= 32 and . != 127))) and
+      ((.port_file // "") | type == "string") and
+      ((.admin_path_file // "") | type == "string")
     )
   ' manifest.json >/dev/null || return 1
   while IFS= read -r run; do
@@ -3089,6 +3125,81 @@ restore_bind_exact() {
   if [[ -z "${RESTORE_TRANSACTION_DIR:-}" && $had_old -eq 1 ]]; then
     root_exec rm -rf "$old" || true
   fi
+}
+
+# 混合架构（宝塔云WAF 等）宿主机管理面辅助函数。
+# 探测新服务器 IP：优先 RESTORE_HOSTSIDE_IP 显式指定，其次公网出口
+# 探测（ipify/ifconfig.me），再退回路由源地址与本机全局地址。全部失败
+# 返回空（调用方跳过 IP 改写并提示人工处理）。
+hostside_detect_new_ip() {
+  local ip=""
+  if [[ -n "${RESTORE_HOSTSIDE_IP:-}" ]]; then
+    printf '%s\n' "$RESTORE_HOSTSIDE_IP"
+    return 0
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    ip="$(curl -4 -fsS --max-time 6 https://api.ipify.org 2>/dev/null || true)"
+    if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+      ip="$(curl -4 -fsS --max-time 6 http://ifconfig.me 2>/dev/null || true)"
+    fi
+  fi
+  if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 8.8.8.8 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+  fi
+  if [[ ! "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] && command -v ip >/dev/null 2>&1; then
+    ip="$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1)"
+  fi
+  if [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then
+    printf '%s\n' "$ip"
+  fi
+  return 0
+}
+
+# 安装混合架构管理面运行依赖（如 CloudWaf 依赖的 ipset）。
+hostside_install_deps() {
+  local dep
+  for dep in "$@"; do
+    [[ -n "$dep" ]] || continue
+    command -v "$dep" >/dev/null 2>&1 && continue
+    echo " - 安装缺失依赖：$dep"
+    if command -v apt-get >/dev/null 2>&1; then
+      apt-get install -y "$dep" >/dev/null 2>&1 || {
+        DEBIAN_FRONTEND=noninteractive apt-get update -qq >/dev/null 2>&1 &&
+          apt-get install -y "$dep" >/dev/null 2>&1 || true
+      }
+    elif command -v dnf >/dev/null 2>&1; then
+      dnf install -y "$dep" >/dev/null 2>&1 || true
+    elif command -v yum >/dev/null 2>&1; then
+      yum install -y "$dep" >/dev/null 2>&1 || true
+    else
+      warn " 无可用包管理器，无法自动安装依赖：$dep"
+    fi
+    command -v "$dep" >/dev/null 2>&1 || \
+      warn " 依赖安装失败，管理面可能无法启动：$dep"
+  done
+  return 0
+}
+
+# 面板配置 IP 改写：配置文件里记录的是源服务器公网 IP（serverip.json、
+# iplist.txt），不改写会导致面板拒绝在新服务器上监听/访问。只替换每个
+# 文件中第一个出现的 IP（即源端服务器 IP），避免误伤其它内容。
+hostside_rewrite_ips() {
+  local new_ip="$1"; shift
+  local cfg old_ip ip_hits
+  [[ -n "$new_ip" ]] || return 0
+  for cfg in "$@"; do
+    [[ -f "$cfg" ]] || continue
+    ip_hits="$(root_exec grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' "$cfg" 2>/dev/null || true)"
+    old_ip="${ip_hits%%$'\n'*}"
+    if [[ -n "$old_ip" && "$old_ip" != "$new_ip" ]]; then
+      if root_exec sed -i "s/${old_ip}/${new_ip}/g" "$cfg"; then
+        echo " - IP 改写：$cfg：${old_ip} -> ${new_ip}"
+      else
+        warn " IP 改写失败：$cfg"
+      fi
+    fi
+  done
+  return 0
 }
 
 compose_networks_from_meta_all() {
@@ -3944,6 +4055,19 @@ transaction_rollback() {
 
   dm_run_with_activity "自动回滚：停止并移除本次新服务" \
     transaction_remove_new_services || services_quiet=0
+  # 混合架构管理面进程（CloudWaf/ipfilter）先于文件回滚停止：进程持有
+  # 可写层文件句柄，不停止会在 bind 回滚后继续在原路径写数据。
+  if [[ -f "${RESTORE_TRANSACTION_DIR}/hostside_service.tsv" ]]; then
+    while IFS= read -r hs_pat; do
+      [[ -n "$hs_pat" ]] || continue
+      pkill -f "$hs_pat" >/dev/null 2>&1 || true
+    done <"${RESTORE_TRANSACTION_DIR}/hostside_service.tsv"
+    sleep 1
+    while IFS= read -r hs_pat; do
+      [[ -n "$hs_pat" ]] || continue
+      pkill -9 -f "$hs_pat" >/dev/null 2>&1 || true
+    done <"${RESTORE_TRANSACTION_DIR}/hostside_service.tsv"
+  fi
   if ((services_quiet == 1)); then
     # 目标文件最后写入、但可能位于已替换 bind 内；严格按修改逆序回滚，
     # 先撤销单文件覆盖，再整体换回 bind，最后恢复 volume。
@@ -4349,7 +4473,22 @@ if jq -e '.binds|length>0' manifest.json >/dev/null 2>&1; then
     fi
   done < <(jq -c '.binds[]' manifest.json)
 fi
-if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0)); then
+if jq -e '.hostside.paths|length>0' manifest.json >/dev/null 2>&1; then
+  while IFS= read -r row; do
+    host="$(jq -r '.host' <<<"$row")"
+    file="$(jq -r '.file' <<<"$row")"
+    hostside_prefix="${host#/}"
+    if [[ ! -f "hostside/$file" ]]; then
+      warn " 宿主机组件缺少备份文件：$host（hostside/$file）"
+      FAILED_HOSTSIDE+=("$host")
+    elif ! dm_run_with_activity "预检宿主机组件归档：$host" \
+      archive_members_safe "hostside/$file" "$hostside_prefix"; then
+      warn " 宿主机组件归档结构异常：$host"
+      FAILED_HOSTSIDE+=("$host")
+    fi
+  done < <(jq -c '.hostside.paths[]' manifest.json)
+fi
+if ((${#FAILED_VOLUMES[@]} > 0 || ${#FAILED_BINDS[@]} > 0 || ${#FAILED_HOSTSIDE[@]} > 0)); then
   print_failure_summary
   exit 1
 fi
@@ -4696,6 +4835,36 @@ if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/
 fi
 transaction_prepare
 
+# [B0] 混合架构宿主机组件（如宝塔云WAF 管理面）：必须在容器 bind 恢复
+# （[C]）之前就位——容器挂载的应用子目录（/www/cloud_waf/nginx 等）要
+# 落在宿主机组件铺好的目录树里；组件归档与 binds 同格式，直接复用
+# restore_bind_exact：同文件系统 mv、安全解压（一次性 alpine 容器）、
+# binds.tsv 回滚 WAL，回滚顺序天然是“子路径先于父路径”。
+RESTORE_STAGE="恢复宿主机管理组件"
+say "[B0] 恢复宿主机管理组件（混合架构）"
+if jq -e '.hostside.paths|length>0' manifest.json >/dev/null 2>&1; then
+  mkdir -p hostside
+  while IFS= read -r row; do
+    dm_host="$(jq -r '.host' <<<"$row")"
+    dm_file="$(jq -r '.file' <<<"$row")"
+    if [[ ! -f "hostside/${dm_file}" ]]; then
+      warn " 宿主机组件缺少备份文件：$dm_host（hostside/${dm_file}）"
+      FAILED_HOSTSIDE+=("$dm_host")
+      continue
+    fi
+    echo " - ${dm_host}"
+    if ! dm_run_with_activity "安装宿主机组件：$dm_host" \
+      restore_bind_exact "$dm_host" "$PWD/hostside/${dm_file}"; then
+      warn " 无法安装宿主机组件：$dm_host"
+      FAILED_HOSTSIDE+=("$dm_host")
+    fi
+  done < <(jq -c '.hostside.paths[]' manifest.json)
+  if ((${#FAILED_HOSTSIDE[@]} > 0)); then
+    print_failure_summary
+    exit 1
+  fi
+fi
+
 RESTORE_STAGE="回灌命名卷"
 say "[B] 回灌命名卷"
 if jq -e '.volumes|length>0' manifest.json >/dev/null 2>&1; then
@@ -4965,6 +5134,119 @@ if jq -e '.runs|length>0' manifest.json >/dev/null 2>&1; then
       printf '%s\t%s\n' "${created:-0000-00-00T00:00:00Z}" "$r"
     done < <(jq -r '.runs[]' manifest.json) | LC_ALL=C sort | cut -f2-
   )
+fi
+
+# [G] 启动混合架构宿主机管理面：组件文件已由 [B0] 就位、数据面容器已由
+# [D][F] 恢复运行。启动序列（btw start）幂等：容器已在运行则跳过，再拉起
+# ipfilter 与 CloudWaf 面板。启动前先安装缺失依赖（ipset）并把面板配置里
+# 的源服务器 IP 改写为新服务器 IP，否则面板不监听、管理端进不去。
+RESTORE_STAGE="启动宿主机管理服务"
+say "[G] 启动混合架构管理面（宝塔云WAF）"
+if jq -e '.hostside.services|length>0' manifest.json >/dev/null 2>&1; then
+  while IFS= read -r hs_row; do
+    hs_app="$(jq -r '.app // "hostside-app"' <<<"$hs_row")"
+    hs_init="$(jq -r '.init // ""' <<<"$hs_row")"
+    hs_start="$(jq -r '.start_arg // "start"' <<<"$hs_row")"
+    hs_port_file="$(jq -r '.port_file // ""' <<<"$hs_row")"
+    hs_admin_path_file="$(jq -r '.admin_path_file // ""' <<<"$hs_row")"
+    echo " - ${hs_app}"
+
+    # 1) 运行依赖（CloudWaf 依赖 ipset，缺失会导致面板启动失败）
+    mapfile -t hs_deps < <(jq -r '.deps[]?' <<<"$hs_row" 2>/dev/null || true)
+    if ((${#hs_deps[@]} > 0)); then
+      hostside_install_deps "${hs_deps[@]}"
+    fi
+
+    # 2) 面板 IP 改写（serverip.json / iplist.txt 记录的是源服务器 IP）
+    hs_new_ip="$(hostside_detect_new_ip || true)"
+    if [[ -z "$hs_new_ip" ]]; then
+      warn " 无法探测新服务器 IP，跳过面板 IP 改写；如面板无法访问，请用 RESTORE_HOSTSIDE_IP=<IP> 重跑恢复"
+    else
+      mapfile -t hs_ip_files < <(jq -r '.ip_rewrite_files[]?' <<<"$hs_row" 2>/dev/null || true)
+      if ((${#hs_ip_files[@]} > 0)); then
+        hostside_rewrite_ips "$hs_new_ip" "${hs_ip_files[@]}"
+      fi
+    fi
+
+    # 3) systemd 单元登记（daemon-reload + 开机自启，与源端 enabled 一致）
+    while IFS= read -r hs_unit; do
+      [[ -f "$hs_unit" ]] || continue
+      if command -v systemctl >/dev/null 2>&1; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl enable "$(basename "$hs_unit")" >/dev/null 2>&1 || true
+        echo " - 已登记 systemd 单元：$(basename "$hs_unit")"
+      fi
+    done < <(jq -r '.units[]?' <<<"$hs_row" 2>/dev/null || true)
+
+    # 4) 启动管理面（幂等：容器已在运行则直接跳过）
+    if [[ -n "$hs_init" && -x "$hs_init" ]]; then
+      if ! "$hs_init" "$hs_start" >/dev/null 2>&1; then
+        warn " 管理面启动命令返回失败：$hs_init $hs_start（继续验证端口）"
+      fi
+    else
+      warn " 管理脚本不存在或不可执行：$hs_init"
+    fi
+
+    # 记录已拉起的进程模式：回滚时先停止再回滚文件（面板进程持有文件句柄，
+    # 不停止会在 bind 回滚后继续在原路径写数据）
+    while IFS= read -r hs_pat; do
+      [[ -n "$hs_pat" ]] || continue
+      printf '%s\n' "$hs_pat" >>"${RESTORE_TRANSACTION_DIR}/hostside_service.tsv"
+    done < <(jq -r '.process_patterns[]?' <<<"$hs_row" 2>/dev/null || true)
+
+    # 5) 等待面板端口就绪并验证（CloudWaf 为 TLS 面板，接受任意 HTTP 状态码）
+    hs_port=""
+    if [[ -n "$hs_port_file" ]]; then
+      hs_port="$(tr -d '[:space:]' <"$hs_port_file" 2>/dev/null || true)"
+    fi
+    [[ "$hs_port" =~ ^[0-9]+$ ]] || hs_port="8379"
+    hs_admin_path=""
+    if [[ -n "$hs_admin_path_file" && -f "$hs_admin_path_file" ]]; then
+      hs_admin_path="$(jq -r '.admin_path // ""' "$hs_admin_path_file" 2>/dev/null || true)"
+    fi
+    [[ -n "$hs_admin_path" ]] || hs_admin_path="/"
+
+    hs_listen_ok=0
+    for _ in $(seq 1 30); do
+      if (ss -tln 2>/dev/null || netstat -tln 2>/dev/null) |
+          grep -E ":${hs_port}[[:space:]]" >/dev/null 2>&1; then
+        hs_listen_ok=1
+        break
+      fi
+      sleep 1
+    done
+    hs_code="$(curl -sk -o /dev/null -w '%{http_code}' -m 10 \
+      "https://127.0.0.1:${hs_port}${hs_admin_path}" 2>/dev/null || true)"
+    # CloudWaf 面板仅接受 TLS 1.3：恢复机自带 curl/OpenSSL 过旧（无 TLS 1.3
+    # 能力）时首次探测必然 000，显式指定版本重试一次再下结论（旧 curl 不认
+    # 识 --tlsv1.3 会直接报错退出，同样落入 000 分支，无副作用）。
+    if [[ -z "$hs_code" || "$hs_code" == "000" ]]; then
+      hs_code="$(curl -sk --tlsv1.3 -o /dev/null -w '%{http_code}' -m 10 \
+        "https://127.0.0.1:${hs_port}${hs_admin_path}" 2>/dev/null || true)"
+    fi
+    if ((hs_listen_ok == 1)) && [[ -n "$hs_code" && "$hs_code" != "000" ]]; then
+      if [[ -n "$hs_new_ip" ]]; then
+        say " 管理端访问地址：https://${hs_new_ip}:${hs_port}${hs_admin_path}"
+      else
+        say " 管理端已就绪：https://<新服务器IP>:${hs_port}${hs_admin_path}"
+      fi
+    elif ((hs_listen_ok == 1)); then
+      # 端口已监听但本机 curl 无响应：面板要求 TLS 1.3 而恢复机 curl 版本过旧
+      # 无法完成握手（TLS 版本协商失败 ≠ 面板故障）。降级为警告，不把整单恢复
+      # 拖入回滚；端口持续监听 30 秒已证明面板进程完成启动。
+      warn " 面板端口 ${hs_port} 已监听，但本机 curl 探测无 HTTP 响应（面板仅支持 TLS 1.3，旧版 curl 可能无法验证）"
+      if [[ -n "$hs_new_ip" ]]; then
+        warn " 请用现代浏览器访问确认：https://${hs_new_ip}:${hs_port}${hs_admin_path}"
+      else
+        warn " 请用现代浏览器访问确认：https://<新服务器IP>:${hs_port}${hs_admin_path}"
+      fi
+      warn " 排查：${hs_init} status；面板日志 /www/cloud_waf/console/logs/error.log"
+    else
+      warn " 管理面未能就绪（端口 ${hs_port} 未监听）"
+      warn " 排查：${hs_init} status；端口占用 ss -lntp | grep ${hs_port}；面板日志 /www/cloud_waf/console/logs/error.log"
+      FAILED_HOSTSIDE+=("$hs_app")
+    fi
+  done < <(jq -c '.hostside.services[]' manifest.json)
 fi
 
 if restore_has_failures; then
@@ -6442,6 +6724,136 @@ for id in "${IDS[@]}"; do
   done < <(jq -c '.[0].Mounts[]?' <<<"$j")
 done
 
+#####################################
+# 混合架构宿主机组件检测与打包（宝塔云WAF）
+#####################################
+# 一类业务（宝塔云WAF）是“Docker 数据面 + 宿主机管理面”混合架构：
+# cloudwaf_nginx/cloudwaf_mysql 容器承载流量与数据，而 CloudWaf 面板
+# 二进制、/etc/init.d/btw、systemd 单元、console 配置（SQLite data.db、
+# serverip.json）与 vhost 站点配置/证书装在宿主机。只迁容器会导致新服务
+# 器管理端打不开（btw 命令不存在、8379 端口不监听、面板 IP 白名单失效）。
+# 检测到选中容器属于此类应用时，把宿主机组件一并打进迁移包；容器 bind
+# 挂载的子目录（nginx/ mysql/ wwwroot/）已随 binds 打包，这里按实际
+# 挂载点排除，避免同一份数据打两份、恢复时互相覆盖。
+HOSTSIDE_PANEL_WAS_RUNNING=0
+declare -a MAN_HOSTSIDE_PATHS=()
+MAN_HOSTSIDE_SERVICES="[]"
+# 供 hostside 打包函数使用的 tar 排除参数（当前应用根目录下的容器挂载点）
+HOSTSIDE_TAR_EXCLUDES=()
+
+archive_hostside_path_to_gzip() {
+  local source="$1" output="$2" rc=0
+  rm -f -- "$output"
+  if tar -C / ${HOSTSIDE_TAR_EXCLUDES[@]+"${HOSTSIDE_TAR_EXCLUDES[@]}"} \
+      -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+    return 0
+  else
+    rc=$?
+  fi
+  rm -f -- "$output"
+  return "$rc"
+}
+
+hostside_pack_path() {
+  local host="$1" out esc src_id
+  esc="$(printf '%s' "${host#/}" | tr -c 'A-Za-z0-9_.-' '_')"
+  src_id="$(printf '%s' "$host" | cksum | awk '{print $1}')"
+  out="${BUNDLE}/hostside/hostside_${esc}_${src_id}.tgz"
+  printf " [HOSTSIDE] %s -> hostside/%s\n" "$host" "$(basename "$out")"
+  if ! run_with_file_progress "打包宿主机组件：$host" "$out" 0 \
+    archive_hostside_path_to_gzip "$host" "$out"; then
+    YEL " [WARN] 宿主机组件打包失败：$host"
+    BACKUP_FAILURES+=("宿主机组件备份失败：$host")
+    return 1
+  fi
+  MAN_HOSTSIDE_PATHS+=("$(jq -cn --arg host "$host" --arg file "$(basename "$out")" \
+    '{host:$host,file:$file}')")
+  return 0
+}
+
+pack_hybrid_hostside() {
+  local cname app_root="/www/cloud_waf" detected=0
+  local bind_src rel top unit
+  local -a exclude_tops=() units=()
+  declare -A exclude_seen=()
+
+  # 检测：选中的容器里有宝塔云WAF 数据面容器，且宿主机存在管理组件
+  for cname in ${CONTAINER_NAME[@]+"${CONTAINER_NAME[@]}"}; do
+    case "$cname" in
+      cloudwaf_*) detected=1; break ;;
+    esac
+  done
+  ((detected == 1)) || return 0
+  [[ -d "$app_root" ]] || return 0
+
+  BLUE "[INFO] 检测到混合架构应用：宝塔云WAF（bt-cloudwaf），打包宿主机管理组件 ..."
+  mkdir -p "${BUNDLE}/hostside"
+
+  # 数据面容器已在停机窗口内；管理面面板仍在运行并写 console/data/data.db
+  # （SQLite）。先用 admin_stop 停止面板保证快照一致（SQLite 崩溃安全，
+  # journal 一并打包），容器重启后再 admin_start 恢复（见下方调用点）。
+  if pgrep -f "${app_root}/console/CloudWaf" >/dev/null 2>&1; then
+    HOSTSIDE_PANEL_WAS_RUNNING=1
+    if [[ -x /etc/init.d/btw ]]; then
+      /etc/init.d/btw admin_stop >/dev/null 2>&1 || \
+        pkill -f "${app_root}/console/CloudWaf" >/dev/null 2>&1 || true
+    else
+      pkill -f "${app_root}/console/CloudWaf" >/dev/null 2>&1 || true
+    fi
+  fi
+
+  # 计算排除集：应用根目录下被容器 bind 挂载的子目录（已随 binds 打包）。
+  # 按挂载点的顶层目录整目录排除，恢复时 [C] 阶段会在该目录下精确补齐。
+  for bind_src in ${BACKED_BINDS[@]+"${!BACKED_BINDS[@]}"}; do
+    case "$bind_src" in
+      "$app_root"/*)
+        rel="${bind_src#"$app_root"/}"
+        top="${app_root#/}/${rel%%/*}"
+        [[ -n "${exclude_seen[$top]:-}" ]] && continue
+        exclude_seen[$top]=1
+        exclude_tops+=("--exclude=$top")
+        ;;
+    esac
+  done
+  HOSTSIDE_TAR_EXCLUDES=(${exclude_tops[@]+"${exclude_tops[@]}"})
+
+  # 1) 应用根目录（含 console 面板、vhost 站点配置与证书）
+  hostside_pack_path "$app_root" || return 1
+  HOSTSIDE_TAR_EXCLUDES=()
+
+  # 2) 管理脚本、CLI 符号链接与 systemd 单元（存在才打包）
+  if [[ -f /etc/init.d/btw ]]; then
+    hostside_pack_path "/etc/init.d/btw" || return 1
+  fi
+  if [[ -e /usr/bin/btw || -L /usr/bin/btw ]]; then
+    hostside_pack_path "/usr/bin/btw" || return 1
+  fi
+  for unit in /usr/lib/systemd/system/btw.service /etc/systemd/system/btw.service; do
+    if [[ -f "$unit" ]]; then
+      units+=("$unit")
+      hostside_pack_path "$unit" || return 1
+    fi
+  done
+
+  # 3) 管理服务元数据：恢复端据此改写面板 IP、安装依赖、启动并验证
+  if [[ -f /etc/init.d/btw ]]; then
+    MAN_HOSTSIDE_SERVICES="$(jq -cn \
+      --arg app "bt-cloudwaf" \
+      --arg init "/etc/init.d/btw" \
+      --arg start_arg "start" \
+      --argjson units "$(printf '%s\n' ${units[@]+"${units[@]}"} | jq -Rsc 'split("\n") | map(select(length>0))')" \
+      --argjson process_patterns '["/www/cloud_waf/console/CloudWaf","/www/cloud_waf/console/ipfilter"]' \
+      --argjson deps '["ipset"]' \
+      --argjson ip_rewrite_files '["/www/cloud_waf/console/config/serverip.json","/www/cloud_waf/console/data/iplist.txt"]' \
+      --arg port_file "/www/cloud_waf/console/data/.server-port" \
+      --arg admin_path_file "/www/cloud_waf/console/config/sysconfig.json" \
+      '{app:$app,init:$init,start_arg:$start_arg,units:$units,process_patterns:$process_patterns,deps:$deps,ip_rewrite_files:$ip_rewrite_files,port_file:$port_file,admin_path_file:$admin_path_file}')"
+  fi
+  return 0
+}
+
+pack_hybrid_hostside
+
 if ((${#BACKUP_FAILURES[@]} > 0)); then
   RED "[ERR] 数据备份不完整，已取消生成迁移包："
   for failure in "${BACKUP_FAILURES[@]}"; do
@@ -6458,6 +6870,17 @@ if ((SOURCE_RESTORE_EXPECTED > 0)); then
   if ! restart_source_containers; then
     RED "[ERR] 源容器未能全部恢复，已停止后续打包，请立即人工检查。"
     exit 1
+  fi
+fi
+
+# 混合架构：容器已重启，恢复源服务器管理面面板（打包前 admin_stop 过，
+# 保持源端运行状态不变）
+if ((HOSTSIDE_PANEL_WAS_RUNNING == 1)) && [[ -x /etc/init.d/btw ]]; then
+  BLUE "[INFO] 重启宝塔云WAF 管理面板 ..."
+  if ! /etc/init.d/btw admin_start >/dev/null 2>&1; then
+    if [[ -d /www/cloud_waf/console ]]; then
+      (cd /www/cloud_waf/console && nohup ./CloudWaf >>logs/error.log 2>&1 &)
+    fi
   fi
 fi
 
@@ -6607,6 +7030,12 @@ generate_manifest_and_restore() {
   else
     binds_json='[]'
   fi
+  # 混合架构宿主机组件（宝塔云WAF 等）：无组件时保持 {}，恢复端自动跳过
+  local hostside_json='{}'
+  if ((${#MAN_HOSTSIDE_PATHS[@]})); then
+    hostside_json="$(printf '%s\n' "${MAN_HOSTSIDE_PATHS[@]}" | \
+      jq -cs --argjson services "${MAN_HOSTSIDE_SERVICES:-[]}" '{paths:.,services:$services}')"
+  fi
 
   jq -n \
     --arg created_at "$STAMP" \
@@ -6617,7 +7046,8 @@ generate_manifest_and_restore() {
     --argjson volumes "$vols_json" \
     --argjson binds "$binds_json" \
     --argjson runs "$runs_json" \
-    '{created_at:$created_at,script_version:$script_version,images:$images,networks:$networks,projects:$projects,volumes:$volumes,binds:$binds,runs:$runs}' \
+    --argjson hostside "$hostside_json" \
+    '{created_at:$created_at,script_version:$script_version,images:$images,networks:$networks,projects:$projects,volumes:$volumes,binds:$binds,runs:$runs,hostside:$hostside}' \
     >"${BUNDLE}/manifest.json"
 
   write_bundle_restore_script "${BUNDLE}/restore.sh"
