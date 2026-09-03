@@ -3022,14 +3022,35 @@ restore_bind_exact() {
     root_exec rm -rf "$stage" || true
     return 1
   fi
-  # bind 根本身若是链接，移动出 staging 后其相对语义会改变；拒绝这种歧义结构。
+  # bind 根本身若是符号链接（常见：/etc/localtime -> /usr/share/zoneinfo/…）：
+  # 绝对链接移动出 staging 后语义不变，直接放行；相对链接移动后指向会改变，
+  # 先按源端父目录词法解析为绝对路径再重写。链接本身不携带文件内容，
+  # 不存在路径逃逸风险，也无需（也不适用）tree_links_stay_within_root 树校验。
   if root_exec test -L "$staged"; then
-    root_exec rm -rf "$stage" || true
-    return 1
-  fi
-  # 最终只会把 $staged 子树移动到宿主 $host，因此链接边界必须以该子树
-  # 为根校验，而不能以更高层 staging 根校验；否则 ../ 可在 mv 后逃逸。
-  if ! tree_links_stay_within_root "$staged"; then
+    dm_link_target="$(root_exec readlink "$staged")" || {
+      root_exec rm -rf "$stage" || true
+      return 1
+    }
+    case "$dm_link_target" in
+      /*) : ;;
+      *)
+        dm_abs_target="$(root_exec realpath -m -- "${parent}/${dm_link_target}" 2>/dev/null ||
+          root_exec python3 -c 'import os, sys; print(os.path.normpath(sys.argv[1]))' "${parent}/${dm_link_target}" 2>/dev/null || true)"
+        if [[ -z "$dm_abs_target" || "$dm_abs_target" != /* ]]; then
+          warn " 绑定根是相对符号链接且无法解析为绝对路径，拒绝恢复：$host -> $dm_link_target"
+          root_exec rm -rf "$stage" || true
+          return 1
+        fi
+        dm_link_target="$dm_abs_target"
+        ;;
+    esac
+    root_exec ln -sfn "$dm_link_target" "$staged" || {
+      root_exec rm -rf "$stage" || true
+      return 1
+    }
+  elif ! tree_links_stay_within_root "$staged"; then
+    # 最终只会把 $staged 子树移动到宿主 $host，因此链接边界必须以该子树
+    # 为根校验，而不能以更高层 staging 根校验；否则 ../ 可在 mv 后逃逸。
     root_exec rm -rf "$stage" || true
     return 1
   fi
