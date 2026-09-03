@@ -1897,7 +1897,14 @@ for m in "${mounts[@]}"; do
     IFS=',' read -r -a mode_parts <<<"$mode"
     for part in "${mode_parts[@]}"; do [[ -n "$part" ]] && opts+=("$part"); done
   fi
-  [[ "$rw" != "true" ]] && opts+=(ro)
+  # Mounts[].Mode 为 "ro"（如 -v /etc/localtime:/etc/localtime:ro）且 RW=false
+  # 时，ro 会来自两个来源；直接叠加会生成 "ro,ro" 并被 daemon 拒绝
+  # （invalid mode: ro,ro）。追加前先判重。
+  if [[ "$rw" != "true" ]]; then
+    dm_have_ro=0
+    for part in "${opts[@]}"; do [[ "$part" == "ro" ]] && dm_have_ro=1; done
+    ((dm_have_ro)) || opts+=(ro)
+  fi
   if ((${#opts[@]})); then
     optstr="$(IFS=,; echo "${opts[*]}")"
     args+=(-v "${src}:${dest}:${optstr}")
