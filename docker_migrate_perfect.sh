@@ -46,7 +46,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.2"
+SCRIPT_VERSION="2.3.3"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -3270,6 +3270,119 @@ hostside_install_deps() {
   return 0
 }
 
+# 混合架构：目标端可能已运行旧管理面（上次迁移后残留、或人工部署过同款
+# 应用）。[B0] 覆盖 /www/cloud_waf 等宿主机组件前必须先停掉旧面板——旧
+# 进程持有文件句柄并占用管理端口，带着它覆盖文件会让 [G] 阶段
+# /etc/init.d/btw start 失败且端口不监听（二次恢复实测踩坑）。
+# "之前在运行"的事实记录到事务目录，回滚时由 hostside_prev_restart 重启。
+hostside_quiesce_existing() {
+  local hs_row hs_init="" hs_start="start" hs_pat hs_unit was_running=0 hs_alive=0
+  local -a hs_units=() hs_pats=()
+  local prev_dir="${RESTORE_TRANSACTION_DIR:-}"
+
+  # 归一化 services（2.3.0 旧包是单个对象，新包是数组）
+  local hs_services
+  hs_services="$(jq -c '(.hostside.services // null) |
+    if type == "object" then [.] elif type == "array" then . else [] end' \
+    manifest.json 2>/dev/null || echo '[]')"
+  jq -e 'length>0' <<<"$hs_services" >/dev/null 2>&1 || return 0
+
+  while IFS= read -r hs_row; do
+    hs_init="$(jq -r '.init // ""' <<<"$hs_row")"
+    hs_start="$(jq -r '.start_arg // "start"' <<<"$hs_row")"
+    while IFS= read -r hs_unit; do
+      [[ -n "$hs_unit" ]] || continue
+      hs_units+=("$(basename "$hs_unit")")
+    done < <(jq -r '.units[]?' <<<"$hs_row" 2>/dev/null || true)
+    while IFS= read -r hs_pat; do
+      [[ -n "$hs_pat" ]] || continue
+      hs_pats+=("$hs_pat")
+    done < <(jq -r '.process_patterns[]?' <<<"$hs_row" 2>/dev/null || true)
+  done < <(jq -c '.[]' <<<"$hs_services")
+  ((${#hs_units[@]} > 0 || ${#hs_pats[@]} > 0)) || return 0
+
+  # 1) 判断旧管理面是否在运行（systemd active 或进程模式命中）
+  if command -v systemctl >/dev/null 2>&1; then
+    for hs_unit in ${hs_units[@]+"${hs_units[@]}"}; do
+      systemctl is-active --quiet "$hs_unit" 2>/dev/null && was_running=1
+    done
+  fi
+  for hs_pat in ${hs_pats[@]+"${hs_pats[@]}"}; do
+    pgrep -f "$hs_pat" >/dev/null 2>&1 && was_running=1
+  done
+  ((was_running == 1)) || return 0
+
+  # 2) 停止：先 systemd（防 Restart= 自动拉起），再 init stop，最后 pkill 兜底
+  if command -v systemctl >/dev/null 2>&1; then
+    for hs_unit in ${hs_units[@]+"${hs_units[@]}"}; do
+      systemctl stop "$hs_unit" >/dev/null 2>&1 || true
+    done
+  fi
+  if ((${#hs_units[@]} == 0)) && [[ -n "$hs_init" && -x "$hs_init" ]]; then
+    "$hs_init" stop >/dev/null 2>&1 || true
+  fi
+  for hs_pat in ${hs_pats[@]+"${hs_pats[@]}"}; do
+    pkill -f "$hs_pat" >/dev/null 2>&1 || true
+  done
+
+  # 3) 确认进程确实退出；仍存活则升级 KILL 后复查，依旧存活拒绝继续
+  sleep 1
+  for hs_pat in ${hs_pats[@]+"${hs_pats[@]}"}; do
+    pgrep -f "$hs_pat" >/dev/null 2>&1 && hs_alive=1
+  done
+  if ((hs_alive == 1)); then
+    for hs_pat in ${hs_pats[@]+"${hs_pats[@]}"}; do
+      pkill -9 -f "$hs_pat" >/dev/null 2>&1 || true
+    done
+    sleep 2
+    hs_alive=0
+    for hs_pat in ${hs_pats[@]+"${hs_pats[@]}"}; do
+      pgrep -f "$hs_pat" >/dev/null 2>&1 && hs_alive=1
+    done
+    if ((hs_alive == 1)); then
+      warn " 目标端旧管理面进程无法停止；为避免覆盖文件时状态混乱，本次恢复终止。"
+      return 1
+    fi
+  fi
+
+  # 4) 记录"之前在运行"，回滚时据此重启旧面板
+  if [[ -n "$prev_dir" ]]; then
+    if ((${#hs_units[@]} > 0)); then
+      printf '%s\n' ${hs_units[@]+"${hs_units[@]}"} \
+        >"${prev_dir}/hostside_prev_units.txt"
+    fi
+    if [[ -n "$hs_init" && -x "$hs_init" ]]; then
+      printf '%s\t%s\n' "$hs_init" "$hs_start" \
+        >"${prev_dir}/hostside_prev_init.txt"
+    fi
+  fi
+  say " - 已停止目标端正在运行的旧管理面（若恢复失败回滚，将自动重启）"
+  return 0
+}
+
+# 回滚后重启旧管理面：此时宿主机组件已回滚为旧状态，用旧配置启动是安全
+# 的。优先 systemd 单元，失败或不可用时退回 init 脚本。
+hostside_prev_restart() {
+  local hs_unit hs_init hs_start restarted=0
+  [[ -f "${RESTORE_TRANSACTION_DIR}/hostside_prev_units.txt" ]] ||
+    [[ -f "${RESTORE_TRANSACTION_DIR}/hostside_prev_init.txt" ]] || return 0
+  if [[ -f "${RESTORE_TRANSACTION_DIR}/hostside_prev_units.txt" ]] &&
+    command -v systemctl >/dev/null 2>&1; then
+    while IFS= read -r hs_unit; do
+      [[ -n "$hs_unit" ]] || continue
+      systemctl start "$hs_unit" >/dev/null 2>&1 && restarted=1
+    done <"${RESTORE_TRANSACTION_DIR}/hostside_prev_units.txt"
+  fi
+  if ((restarted == 0)) &&
+    [[ -f "${RESTORE_TRANSACTION_DIR}/hostside_prev_init.txt" ]]; then
+    while IFS=$'\t' read -r hs_init hs_start; do
+      [[ -n "$hs_init" ]] || continue
+      "${hs_init}" "${hs_start:-start}" >/dev/null 2>&1 || true
+    done <"${RESTORE_TRANSACTION_DIR}/hostside_prev_init.txt"
+  fi
+  return 0
+}
+
 # 面板配置 IP 改写：配置文件里记录的是源服务器公网 IP（serverip.json、
 # iplist.txt），不改写会导致面板拒绝在新服务器上监听/访问。只替换每个
 # 文件中第一个出现的 IP（即源端服务器 IP），避免误伤其它内容。
@@ -4179,6 +4292,13 @@ transaction_rollback() {
     else
       warn "数据回滚不完整，旧服务与共享写入者保持停止，请按回滚目录人工处理。"
     fi
+
+    # 混合架构：恢复前在运行的旧管理面（[B0] 覆盖文件前被静默）重新拉起。
+    # 此时宿主机组件已回滚为旧状态，用旧配置启动是安全的。
+    if ((data_ok == 1)); then
+      say "[进度] 自动回滚：重启旧管理面面板"
+      hostside_prev_restart
+    fi
   else
     rc=1
     data_ok=0
@@ -4922,6 +5042,17 @@ if jq -e '(.volumes | length) > 0 or (.binds | length) > 0' manifest.json >/dev/
   }
 fi
 transaction_prepare
+
+# 混合架构：目标端若已运行旧管理面（二次迁移、重跑恢复场景），必须先停
+# 止旧面板——旧进程持有 /www/cloud_waf 文件句柄并占用管理端口，直接覆盖
+# 文件会导致 [G] 阶段新面板启动失败、端口不监听。恢复失败回滚时自动重启。
+if jq -e '.hostside.paths|length>0' manifest.json >/dev/null 2>&1; then
+  if ! hostside_quiesce_existing; then
+    FAILED_HOSTSIDE+=("旧管理面停止失败")
+    print_failure_summary
+    exit 1
+  fi
+fi
 
 # [B0] 混合架构宿主机组件（如宝塔云WAF 管理面）：必须在容器 bind 恢复
 # （[C]）之前就位——容器挂载的应用子目录（/www/cloud_waf/nginx 等）要

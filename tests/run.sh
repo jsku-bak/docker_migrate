@@ -931,6 +931,254 @@ test_firewall_warns_when_no_backend_available() {
   grep -Fq '手动放行' <<<"$output"
 }
 
+# ---- 混合架构：二次恢复前静默旧管理面 / 回滚后重启旧面板 ----
+
+# 写入 mock 的 /etc/init.d/btw 与含 hostside.services 的 manifest.json。
+write_hostside_manifest() {
+  local dir="$1"
+  cat >"${dir}/btw" <<'SH'
+#!/bin/sh
+printf 'init %s\n' "$1" >>"$HS_LOG"
+exit 0
+SH
+  chmod +x "${dir}/btw"
+  cat >"${dir}/manifest.json" <<JSON
+{"hostside":{"paths":[{"host":"/www/cloud_waf","file":"a.tgz"}],
+ "services":[{"app":"bt-cloudwaf","init":"${dir}/btw","start_arg":"start",
+ "units":["/usr/lib/systemd/system/btw.service"],
+ "process_patterns":["/www/cloud_waf/console/CloudWaf"]}]}}
+JSON
+}
+
+test_hostside_quiesce_stops_running_panel() {
+  local tmp rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin" "${tmp}/state" "${tmp}/txn"
+  write_hostside_manifest "$tmp"
+  cat >"${tmp}/bin/systemctl" <<'SH'
+#!/bin/sh
+case "$1" in
+  is-active)
+    [ -f "$HS_STATE/stopped" ] && exit 3
+    exit 0
+    ;;
+  stop)
+    : >"$HS_STATE/stopped"
+    printf 'systemctl stop %s\n' "$2" >>"$HS_LOG"
+    ;;
+  start)
+    printf 'systemctl start %s\n' "$2" >>"$HS_LOG"
+    ;;
+esac
+exit 0
+SH
+  cat >"${tmp}/bin/pgrep" <<'SH'
+#!/bin/sh
+[ -f "$HS_STATE/stopped" ] && exit 1
+exit 0
+SH
+  cat >"${tmp}/bin/pkill" <<'SH'
+#!/bin/sh
+printf 'pkill %s\n' "$*" >>"$HS_LOG"
+: >"$HS_STATE/stopped"
+exit 0
+SH
+  chmod +x "${tmp}/bin/systemctl" "${tmp}/bin/pgrep" "${tmp}/bin/pkill"
+  : >"${tmp}/calls.log"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^hostside_quiesce_existing() {/,/^}/p' \
+    -e '/^hostside_prev_restart() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  set +e
+  (
+    say() { :; }
+    warn() { :; }
+    export HS_STATE="${tmp}/state" HS_LOG="${tmp}/calls.log"
+    export RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    hostside_quiesce_existing
+  )
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 0 ]]
+  grep -q 'systemctl stop btw.service' "${tmp}/calls.log"
+  grep -q 'pkill -f /www/cloud_waf/console/CloudWaf' "${tmp}/calls.log"
+  [[ "$(<"${tmp}/txn/hostside_prev_units.txt")" == "btw.service" ]]
+  [[ "$(<"${tmp}/txn/hostside_prev_init.txt")" == "${tmp}/btw"$'\t'"start" ]]
+}
+
+test_hostside_quiesce_noop_when_panel_not_running() {
+  local tmp rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin" "${tmp}/state" "${tmp}/txn"
+  write_hostside_manifest "$tmp"
+  cat >"${tmp}/bin/systemctl" <<'SH'
+#!/bin/sh
+[ "$1" = "is-active" ] && exit 3
+exit 0
+SH
+  cat >"${tmp}/bin/pgrep" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  cat >"${tmp}/bin/pkill" <<'SH'
+#!/bin/sh
+printf 'pkill %s\n' "$*" >>"$HS_LOG"
+exit 0
+SH
+  chmod +x "${tmp}/bin/systemctl" "${tmp}/bin/pgrep" "${tmp}/bin/pkill"
+  : >"${tmp}/calls.log"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^hostside_quiesce_existing() {/,/^}/p' \
+    -e '/^hostside_prev_restart() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  set +e
+  (
+    say() { :; }
+    warn() { :; }
+    export HS_STATE="${tmp}/state" HS_LOG="${tmp}/calls.log"
+    export RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    hostside_quiesce_existing
+  )
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 0 ]]
+  [[ ! -s "${tmp}/calls.log" ]]
+  [[ ! -e "${tmp}/txn/hostside_prev_units.txt" ]]
+  [[ ! -e "${tmp}/txn/hostside_prev_init.txt" ]]
+}
+
+test_hostside_quiesce_fails_when_process_survives() {
+  local tmp rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin" "${tmp}/state" "${tmp}/txn"
+  write_hostside_manifest "$tmp"
+  cat >"${tmp}/bin/systemctl" <<'SH'
+#!/bin/sh
+case "$1" in
+  is-active) exit 0 ;;
+  stop) printf 'systemctl stop %s\n' "$2" >>"$HS_LOG" ;;
+esac
+exit 0
+SH
+  cat >"${tmp}/bin/pgrep" <<'SH'
+#!/bin/sh
+exit 0
+SH
+  cat >"${tmp}/bin/pkill" <<'SH'
+#!/bin/sh
+printf 'pkill %s\n' "$*" >>"$HS_LOG"
+exit 0
+SH
+  chmod +x "${tmp}/bin/systemctl" "${tmp}/bin/pgrep" "${tmp}/bin/pkill"
+  : >"${tmp}/calls.log"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^hostside_quiesce_existing() {/,/^}/p' \
+    -e '/^hostside_prev_restart() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  set +e
+  (
+    say() { :; }
+    warn() { :; }
+    export HS_STATE="${tmp}/state" HS_LOG="${tmp}/calls.log"
+    export RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    hostside_quiesce_existing
+  )
+  rc=$?
+  set -e
+
+  [[ "$rc" -eq 1 ]]
+  [[ ! -e "${tmp}/txn/hostside_prev_units.txt" ]]
+  [[ ! -e "${tmp}/txn/hostside_prev_init.txt" ]]
+}
+
+test_hostside_prev_restart_prefers_systemd_unit() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin" "${tmp}/txn"
+  write_hostside_manifest "$tmp"
+  cat >"${tmp}/bin/systemctl" <<'SH'
+#!/bin/sh
+[ "$1" = "start" ] && printf 'systemctl start %s\n' "$2" >>"$HS_LOG"
+exit 0
+SH
+  chmod +x "${tmp}/bin/systemctl"
+  : >"${tmp}/calls.log"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^hostside_quiesce_existing() {/,/^}/p' \
+    -e '/^hostside_prev_restart() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  printf 'btw.service\n' >"${tmp}/txn/hostside_prev_units.txt"
+  printf '%s\t%s\n' "${tmp}/btw" start >"${tmp}/txn/hostside_prev_init.txt"
+
+  (
+    say() { :; }
+    warn() { :; }
+    export HS_LOG="${tmp}/calls.log"
+    export RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    export PATH="${tmp}/bin:$PATH"
+    hostside_prev_restart
+  )
+  grep -q 'systemctl start btw.service' "${tmp}/calls.log"
+  ! grep -q 'init start' "${tmp}/calls.log"
+}
+
+test_hostside_prev_restart_falls_back_to_init() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin" "${tmp}/txn"
+  write_hostside_manifest "$tmp"
+  cat >"${tmp}/bin/systemctl" <<'SH'
+#!/bin/sh
+[ "$1" = "start" ] && exit 1
+exit 0
+SH
+  chmod +x "${tmp}/bin/systemctl"
+  : >"${tmp}/calls.log"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^hostside_quiesce_existing() {/,/^}/p' \
+    -e '/^hostside_prev_restart() {/,/^}/p' "${tmp}/restore.sh")
+  trap 'rm -rf "$tmp"' RETURN
+
+  printf '%s\t%s\n' "${tmp}/btw" start >"${tmp}/txn/hostside_prev_init.txt"
+
+  (
+    say() { :; }
+    warn() { :; }
+    export HS_LOG="${tmp}/calls.log"
+    export RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    export PATH="${tmp}/bin:$PATH"
+    hostside_prev_restart
+  )
+  grep -q 'init start' "${tmp}/calls.log"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -967,6 +1215,11 @@ run_test "firewall firewalld allow rule is added and revoked" test_firewall_fire
 run_test "firewall iptables allow rule is added and revoked" test_firewall_iptables_allow_and_revoke
 run_test "firewall skips pre-existing allow rules" test_firewall_skips_existing_rule
 run_test "firewall warns when no backend can be configured" test_firewall_warns_when_no_backend_available
+run_test "hostside quiesce stops a running panel and records restart info" test_hostside_quiesce_stops_running_panel
+run_test "hostside quiesce is a no-op when no panel is running" test_hostside_quiesce_noop_when_panel_not_running
+run_test "hostside quiesce refuses to continue when the panel survives kills" test_hostside_quiesce_fails_when_process_survives
+run_test "hostside rollback restart prefers the systemd unit" test_hostside_prev_restart_prefers_systemd_unit
+run_test "hostside rollback restart falls back to the init script" test_hostside_prev_restart_falls_back_to_init
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))

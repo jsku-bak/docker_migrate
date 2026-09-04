@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Bug fixes
+
+- Fix re-running a hybrid (bt-cloudwaf) restore on a target that already has the management plane running (e.g. restoring a second migration over a previous successful one, or re-running a failed restore). The old panel process holds open file handles under `/www/cloud_waf` and occupies the 8379 admin port; `[B0]` used to overwrite those files underneath it, leaving the process in a confused state so the `[G]` stage's `/etc/init.d/btw start` failed and the port never listened — the whole restore then rolled back. Restore now quiesces the pre-existing management plane right after the rollback transaction is prepared: it stops the systemd unit first (so `Restart=` cannot bring it back), falls back to the init script and a pattern-based `pkill`, and refuses to continue (safe rollback) only if the old process cannot be stopped at all. Whether the old panel was running is recorded in the transaction directory, and on rollback — after files and containers are back to their old state — the old panel is restarted automatically, so a failed re-restore no longer leaves the previously working management plane down.
+
 ### New features
 
 - Change the default HTTP transfer port from 8080 to 8099 and open it in the firewall automatically. Before the download server starts, the script detects an active firewall (ufw via `/etc/ufw/ufw.conf`, then firewalld, then iptables with DROP/REJECT rules present) and allows exactly the chosen port — the 8099 default, a `PORT=` override, an interactively entered custom port, or an auto-incremented port when the requested one is busy. Rules the script added itself are revoked when the transfer service stops (including the unexpected-exit path); pre-existing user rules are detected and left untouched. When nothing can be opened automatically (e.g. cloud security groups), a warning tells the user which port to open manually.
