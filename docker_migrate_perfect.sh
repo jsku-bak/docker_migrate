@@ -22,7 +22,8 @@
 # - 恢复已暂停容器时会先 unpause，再 start / remove。
 #
 # 环境变量：
-# PORT=8080             默认 HTTP 端口（会询问你要不要改；被占用则向后尝试）
+# PORT=8099             默认 HTTP 端口（会询问你要不要改；被占用则向后尝试；
+#                       启动下载服务时会自动在防火墙放行所选端口，传输结束自动撤销）
 # ADVERTISE_HOST=IP     下载链接里使用的域名/IP（默认自动探测）
 # RESTORE_KEEP=1        恢复后保留下载包与解压目录
 # RESTORE_CLEAN_ALL=1   恢复失败也强制清理文件
@@ -45,7 +46,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.3.2"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -298,7 +299,7 @@ show_help() {
   bash docker_migrate_perfect.sh --restore[=URL]
 
 环境变量:
-  PORT=8080                 HTTP 端口（被占用会自动递增）
+  PORT=8099                 HTTP 端口（默认 8099；自动放行防火墙，被占用会自动递增）
   ADVERTISE_HOST=IP         下载链接中使用的主机名/IP
   RESTORE_EXISTING=replace  同名容器策略：replace、skip 或 fail
   RESTORE_KEEP=1            恢复后保留文件
@@ -643,7 +644,7 @@ pick_advertise_url() {
 }
 
 pick_free_port() {
-  local p="${1:-8080}"
+  local p="${1:-8099}"
   local i
   for i in $(seq 0 50); do
     if command -v ss >/dev/null 2>&1; then
@@ -662,7 +663,87 @@ pick_free_port() {
     fi
     p=$((p + 1))
   done
-  echo "${1:-8080}"
+  echo "${1:-8099}"
+}
+
+# 迁移包下载端口的防火墙放行：按 ufw -> firewalld -> iptables 顺序探测
+# （均需处于启用状态才动手），只放行本次选定的端口；规则由本脚本添加时
+# 记录在 FIREWALL_OPEN_* 里，传输服务停止后由 firewall_revoke_port 撤销，
+# 已存在的放行规则不会被重复添加、也不会被撤销。
+firewall_allow_port() {
+  local port="$1"
+  FIREWALL_OPEN_PORT=""
+  FIREWALL_OPEN_BACKEND=""
+  if [[ ! "$port" =~ ^[0-9]+$ ]]; then
+    YEL "[WARN] 端口号无效（${port}），跳过防火墙放行。"
+    return 0
+  fi
+  if command -v ufw >/dev/null 2>&1 &&
+    grep -qs '^ENABLED=yes' "${DM_UFW_CONF:-/etc/ufw/ufw.conf}"; then
+    if asudo ufw status 2>/dev/null | grep -qE "(^|[[:space:]])${port}/tcp"; then
+      BLUE "[INFO] 防火墙 ufw 已放行端口 ${port}/tcp，无需重复添加。"
+      return 0
+    fi
+    if asudo ufw allow "${port}/tcp" >/dev/null 2>&1; then
+      FIREWALL_OPEN_PORT="$port"
+      FIREWALL_OPEN_BACKEND="ufw"
+      OK "[OK] 已在防火墙 ufw 放行端口 ${port}/tcp（传输结束后自动撤销）"
+      return 0
+    fi
+  fi
+  if command -v firewall-cmd >/dev/null 2>&1 &&
+    asudo firewall-cmd --state 2>/dev/null | grep -q running; then
+    if asudo firewall-cmd --query-port="${port}/tcp" >/dev/null 2>&1; then
+      BLUE "[INFO] 防火墙 firewalld 已放行端口 ${port}/tcp，无需重复添加。"
+      return 0
+    fi
+    if asudo firewall-cmd --add-port="${port}/tcp" >/dev/null 2>&1; then
+      FIREWALL_OPEN_PORT="$port"
+      FIREWALL_OPEN_BACKEND="firewalld"
+      OK "[OK] 已在防火墙 firewalld 放行端口 ${port}/tcp（运行时规则，传输结束后自动撤销）"
+      return 0
+    fi
+  fi
+  if command -v iptables >/dev/null 2>&1 &&
+    asudo iptables -S INPUT 2>/dev/null |
+    grep -qE -- '(^-P .* (DROP|REJECT))|(-j (DROP|REJECT))'; then
+    if asudo iptables -C INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      BLUE "[INFO] 防火墙 iptables 已放行端口 ${port}/tcp，无需重复添加。"
+      return 0
+    fi
+    if asudo iptables -I INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1; then
+      FIREWALL_OPEN_PORT="$port"
+      FIREWALL_OPEN_BACKEND="iptables"
+      OK "[OK] 已在防火墙 iptables 放行端口 ${port}/tcp（传输结束后自动撤销）"
+      return 0
+    fi
+  fi
+  YEL "[WARN] 未能自动放行防火墙端口 ${port}/tcp；若目标服务器下载不通，请手动放行该端口。"
+  return 0
+}
+
+firewall_revoke_port() {
+  local port backend
+  [[ -n "${FIREWALL_OPEN_PORT:-}" ]] || return 0
+  port="$FIREWALL_OPEN_PORT"
+  backend="$FIREWALL_OPEN_BACKEND"
+  FIREWALL_OPEN_PORT=""
+  FIREWALL_OPEN_BACKEND=""
+  case "$backend" in
+    ufw)
+      asudo ufw delete allow "${port}/tcp" >/dev/null 2>&1 ||
+        YEL "[WARN] 未能撤销 ufw 放行规则 ${port}/tcp，请手动删除。"
+      ;;
+    firewalld)
+      asudo firewall-cmd --remove-port="${port}/tcp" >/dev/null 2>&1 ||
+        YEL "[WARN] 未能撤销 firewalld 放行规则 ${port}/tcp，请手动删除。"
+      ;;
+    iptables)
+      asudo iptables -D INPUT -p tcp --dport "$port" -j ACCEPT >/dev/null 2>&1 ||
+        YEL "[WARN] 未能撤销 iptables 放行规则 ${port}/tcp，请手动删除。"
+      ;;
+  esac
+  OK "[OK] 已撤销防火墙放行规则：${backend} ${port}/tcp"
 }
 
 json_array_from_lines() {
@@ -5852,7 +5933,7 @@ done
 #####################################
 # Bundle 路径与 ID
 #####################################
-DEFAULT_PORT="${PORT:-8080}"
+DEFAULT_PORT="${PORT:-8099}"
 PORT="$(pick_free_port "$DEFAULT_PORT")"
 WORKDIR="$(pwd)"
 STAMP="$(date +%Y%m%d-%H%M%S)"
@@ -5896,15 +5977,19 @@ HTTP_EXIT_UNEXPECTED=0
 HTTP_DIAGNOSTICS_SHOWN=0
 HTTP_CLEANUP_STATUS="未启动"
 CLEANUP_STATUS="未执行"
+FIREWALL_OPEN_PORT=""
+FIREWALL_OPEN_BACKEND=""
 
 cleanup_http() {
   if ((HTTP_WAS_STARTED == 0)); then
     HTTP_CLEANUP_STATUS="未启动"
+    firewall_revoke_port || true
     return 0
   fi
   if ((HTTP_EXIT_UNEXPECTED == 1)); then
     SHPID=""
     HTTP_CLEANUP_STATUS="异常退出"
+    firewall_revoke_port || true
     return 1
   fi
   if [[ -n "${SHPID:-}" ]] && kill -0 "${SHPID}" 2>/dev/null; then
@@ -5920,6 +6005,7 @@ cleanup_http() {
   fi
   SHPID=""
   HTTP_CLEANUP_STATUS="已停止"
+  firewall_revoke_port || true
 }
 
 hard_clean() {
@@ -7151,6 +7237,10 @@ if [[ -t 0 ]]; then
     fi
   fi
 fi
+
+# 端口已最终确定（默认 8099 / PORT 环境变量 / 交互输入 / 被占用自动递增），
+# 启动下载服务前先放行防火墙；仅放行本脚本自己添加的规则，结束后撤销。
+firewall_allow_port "$PORT"
 
 SECRET_TOKEN="$(head -c 12 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)"
 BASE_URL="$(pick_advertise_url "$PORT")"

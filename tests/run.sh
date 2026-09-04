@@ -773,6 +773,164 @@ test_manifest_validates_compose_working_directories() {
   ! bundle_manifest_is_safe "${tmp}/bundle"
 }
 
+test_firewall_ufw_allow_and_revoke() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  printf 'ENABLED=yes\n' >"${tmp}/ufw.conf"
+  cat >"${tmp}/bin/ufw" <<'SH'
+#!/bin/sh
+case "$1" in
+  status)
+    printf 'Status: active\n\nTo                         Action      From\n'
+    exit 0
+    ;;
+  allow | delete)
+    printf '%s\n' "$*" >>"$FW_LOG"
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  chmod +x "${tmp}/bin/ufw"
+  : >"${tmp}/fw.log"
+
+  (
+    asudo() { "$@"; }
+    export PATH="${tmp}/bin:$PATH" FW_LOG="${tmp}/fw.log" DM_UFW_CONF="${tmp}/ufw.conf"
+    firewall_allow_port 8099
+    [[ "${FIREWALL_OPEN_BACKEND:-}" == "ufw" ]]
+    [[ "${FIREWALL_OPEN_PORT:-}" == "8099" ]]
+    firewall_revoke_port
+    [[ -z "${FIREWALL_OPEN_PORT:-}" ]]
+  )
+  grep -q 'allow 8099/tcp' "${tmp}/fw.log"
+  grep -q 'delete allow 8099/tcp' "${tmp}/fw.log"
+}
+
+test_firewall_firewalld_allow_and_revoke() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  cat >"${tmp}/bin/firewall-cmd" <<'SH'
+#!/bin/sh
+case "$1" in
+  --state)
+    printf 'running\n'
+    exit 0
+    ;;
+  --query-port=*) exit 1 ;;
+  --add-port=* | --remove-port=*)
+    printf '%s\n' "$1" >>"$FW_LOG"
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  chmod +x "${tmp}/bin/firewall-cmd"
+  : >"${tmp}/fw.log"
+
+  (
+    asudo() { "$@"; }
+    export PATH="${tmp}/bin:$PATH" FW_LOG="${tmp}/fw.log" DM_UFW_CONF="${tmp}/absent.conf"
+    firewall_allow_port 8099
+    [[ "${FIREWALL_OPEN_BACKEND:-}" == "firewalld" ]]
+    firewall_revoke_port
+    [[ -z "${FIREWALL_OPEN_PORT:-}" ]]
+  )
+  grep -q -- '--add-port=8099/tcp' "${tmp}/fw.log"
+  grep -q -- '--remove-port=8099/tcp' "${tmp}/fw.log"
+}
+
+test_firewall_iptables_allow_and_revoke() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  cat >"${tmp}/bin/iptables" <<'SH'
+#!/bin/sh
+case "$1" in
+  -S)
+    printf -- '-P INPUT DROP\n'
+    exit 0
+    ;;
+  -C) exit 1 ;;
+  -I | -D)
+    printf '%s\n' "$*" >>"$FW_LOG"
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  chmod +x "${tmp}/bin/iptables"
+  cat >"${tmp}/bin/firewall-cmd" <<'SH'
+#!/bin/sh
+exit 1
+SH
+  chmod +x "${tmp}/bin/firewall-cmd"
+  : >"${tmp}/fw.log"
+
+  (
+    asudo() { "$@"; }
+    export PATH="${tmp}/bin:$PATH" FW_LOG="${tmp}/fw.log" DM_UFW_CONF="${tmp}/absent.conf"
+    firewall_allow_port 8123
+    [[ "${FIREWALL_OPEN_BACKEND:-}" == "iptables" ]]
+    firewall_revoke_port
+    [[ -z "${FIREWALL_OPEN_PORT:-}" ]]
+  )
+  grep -q -- '-I INPUT -p tcp --dport 8123 -j ACCEPT' "${tmp}/fw.log"
+  grep -q -- '-D INPUT -p tcp --dport 8123 -j ACCEPT' "${tmp}/fw.log"
+}
+
+test_firewall_skips_existing_rule() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/bin"
+  printf 'ENABLED=yes\n' >"${tmp}/ufw.conf"
+  cat >"${tmp}/bin/ufw" <<'SH'
+#!/bin/sh
+case "$1" in
+  status)
+    printf 'Status: active\n\nTo                         Action      From\n'
+    printf -- '-                          --           --\n'
+    printf '8099/tcp                   ALLOW       Anywhere\n'
+    exit 0
+    ;;
+  allow | delete)
+    printf '%s\n' "$*" >>"$FW_LOG"
+    exit 0
+    ;;
+esac
+exit 1
+SH
+  chmod +x "${tmp}/bin/ufw"
+  : >"${tmp}/fw.log"
+
+  (
+    asudo() { "$@"; }
+    export PATH="${tmp}/bin:$PATH" FW_LOG="${tmp}/fw.log" DM_UFW_CONF="${tmp}/ufw.conf"
+    firewall_allow_port 8099
+    [[ -z "${FIREWALL_OPEN_PORT:-}" ]]
+    firewall_revoke_port
+  )
+  [[ ! -s "${tmp}/fw.log" ]]
+}
+
+test_firewall_warns_when_no_backend_available() {
+  local tmp output
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/emptybin"
+  output="$(
+    PATH="${tmp}/emptybin" DM_UFW_CONF="${tmp}/absent.conf" \
+      firewall_allow_port 8099 2>&1
+  )"
+  grep -Fq '手动放行' <<<"$output"
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -804,6 +962,11 @@ run_test "bind mount overlap detection respects path boundaries" test_mount_path
 run_test "manifest rejects executable paths outside runs" test_manifest_rejects_unsafe_run_paths
 run_test "manifest rejects control characters in bind paths" test_manifest_rejects_control_characters_in_bind_paths
 run_test "manifest validates Compose working directories" test_manifest_validates_compose_working_directories
+run_test "firewall ufw allow rule is added and revoked" test_firewall_ufw_allow_and_revoke
+run_test "firewall firewalld allow rule is added and revoked" test_firewall_firewalld_allow_and_revoke
+run_test "firewall iptables allow rule is added and revoked" test_firewall_iptables_allow_and_revoke
+run_test "firewall skips pre-existing allow rules" test_firewall_skips_existing_rule
+run_test "firewall warns when no backend can be configured" test_firewall_warns_when_no_backend_available
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))
