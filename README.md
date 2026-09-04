@@ -36,6 +36,12 @@ bash <(curl -fsSL https://raw.githubusercontent.com/jsku-bak/docker_migrate/refs
 
 ## 更新说明
 
+### 修复：宝塔云WAF 混合架构迁移包恢复被拒绝（manifest 结构不安全）的问题
+
+- **现象**：新服务器上下载、解密、完整性校验全部通过后，报 `迁移包 manifest 结构或路径不安全，拒绝恢复`，整单迁移失败。
+- **原因**：备份端把 manifest 里的 `hostside.services` 写成单个 JSON 对象，而恢复端的校验器和管理面启动阶段都按数组处理，写读不一致导致所有混合架构（宝塔云WAF）迁移包被误拒。
+- **修复**：恢复端同时兼容对象（旧包）与数组（新包）两种形态；备份端今后统一写数组。**旧的 2.3.0 迁移包无需重新打包、无需重新下载**，在新服务器用新版脚本对保留的恢复目录重跑恢复即可。
+
 ### 修复：旧环境服务器上恢复失败（unpigz/zlib 版本过旧）的问题
 
 - **现象**：恢复到刻意保持旧环境的服务器时，报 `failed to register layer: exit status 22: unpigz: abort: zlib version less than 1.2.3`，拉取卷操作镜像 `alpine:3.20` 失败，恢复在建立回滚事务前安全终止（数据未被修改）。

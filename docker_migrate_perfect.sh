@@ -45,7 +45,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -2847,7 +2847,23 @@ restore_verify_checksums() {
 
 restore_manifest_is_safe() {
   local run name metadata_name
+  # 注意：2.3.0 备份端把 hostside.services 写成单个 JSON 对象而不是数组，
+  # 此处必须同时接受两种形态，否则所有混合架构（宝塔云WAF）迁移包都会在
+  # "迁移包校验" 阶段被整体拒绝。
   jq -e '
+    def hostside_service_ok:
+      (.init // "" | test("^/etc/init\\.d/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      (.start_arg // "start" | test("^[A-Za-z0-9_-]+$")) and
+      ((.units // []) | type == "array") and
+      all(.units[]?; test("^/(usr/lib|etc)/systemd/system/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
+      ((.process_patterns // []) | type == "array" and all(.[]; type == "string")) and
+      ((.deps // []) | type == "array" and all(.[]; test("^[A-Za-z0-9][A-Za-z0-9_.+-]*$"))) and
+      ((.ip_rewrite_files // []) | type == "array" and
+        all(.[]; type == "string" and startswith("/") and
+          (test("(^|/)\\.\\.(/|$)") | not) and
+          all(explode[]; . >= 32 and . != 127))) and
+      ((.port_file // "") | type == "string") and
+      ((.admin_path_file // "") | type == "string");
     type == "object" and
     (.images | type == "array") and
     (.networks | type == "array") and
@@ -2877,21 +2893,14 @@ restore_manifest_is_safe() {
         all(explode[]; . >= 32 and . != 127)) and
       (.file | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9_.-]*\\.tgz$"))
     ) and
-    ((.hostside.services // []) | type == "array") and
-    all((.hostside.services // [])[];
-      (.init // "" | test("^/etc/init\\.d/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
-      (.start_arg // "start" | test("^[A-Za-z0-9_-]+$")) and
-      ((.units // []) | type == "array") and
-      all(.units[]?; test("^/(usr/lib|etc)/systemd/system/[A-Za-z0-9][A-Za-z0-9_.-]*$")) and
-      ((.process_patterns // []) | type == "array" and all(.[]; type == "string")) and
-      ((.deps // []) | type == "array" and all(.[]; test("^[A-Za-z0-9][A-Za-z0-9_.+-]*$"))) and
-      ((.ip_rewrite_files // []) | type == "array" and
-        all(.[]; type == "string" and startswith("/") and
-          (test("(^|/)\\.\\.(/|$)") | not) and
-          all(explode[]; . >= 32 and . != 127))) and
-      ((.port_file // "") | type == "string") and
-      ((.admin_path_file // "") | type == "string")
-    )
+    # services 兼容两种形态：旧包（<=2.3.0）为单个对象，新包为数组。
+    ((.hostside.services // null) as $svc |
+      if $svc == null then true
+      elif ($svc | type) == "object" then
+        (($svc | length) == 0) or ($svc | hostside_service_ok)
+      elif ($svc | type) == "array" then
+        all($svc[]; hostside_service_ok)
+      else false end)
   ' manifest.json >/dev/null || return 1
   while IFS= read -r run; do
     [[ -f "${BUNDLE_DIR}/${run}" ]] || return 1
@@ -5142,7 +5151,12 @@ fi
 # 的源服务器 IP 改写为新服务器 IP，否则面板不监听、管理端进不去。
 RESTORE_STAGE="启动宿主机管理服务"
 say "[G] 启动混合架构管理面（宝塔云WAF）"
-if jq -e '.hostside.services|length>0' manifest.json >/dev/null 2>&1; then
+# 旧迁移包（<=2.3.0）的 hostside.services 是单个对象，新包是数组；先归一化
+# 成数组再迭代，两种包都能正确拉起管理面。
+hs_services="$(jq -c '(.hostside.services // null) |
+  if type == "object" then [.] elif type == "array" then . else [] end' \
+  manifest.json 2>/dev/null || echo '[]')"
+if jq -e 'length>0' <<<"$hs_services" >/dev/null 2>&1; then
   while IFS= read -r hs_row; do
     hs_app="$(jq -r '.app // "hostside-app"' <<<"$hs_row")"
     hs_init="$(jq -r '.init // ""' <<<"$hs_row")"
@@ -5246,7 +5260,7 @@ if jq -e '.hostside.services|length>0' manifest.json >/dev/null 2>&1; then
       warn " 排查：${hs_init} status；端口占用 ss -lntp | grep ${hs_port}；面板日志 /www/cloud_waf/console/logs/error.log"
       FAILED_HOSTSIDE+=("$hs_app")
     fi
-  done < <(jq -c '.hostside.services[]' manifest.json)
+  done < <(jq -c '.[]' <<<"$hs_services")
 fi
 
 if restore_has_failures; then
@@ -6835,7 +6849,9 @@ pack_hybrid_hostside() {
     fi
   done
 
-  # 3) 管理服务元数据：恢复端据此改写面板 IP、安装依赖、启动并验证
+  # 3) 管理服务元数据：恢复端据此改写面板 IP、安装依赖、启动并验证。
+  #    services 必须是数组（恢复端按数组迭代校验与消费）；2.3.0 曾误写成
+  #    单个对象，导致恢复端整体拒绝迁移包（新版恢复端已兼容两种形态）。
   if [[ -f /etc/init.d/btw ]]; then
     MAN_HOSTSIDE_SERVICES="$(jq -cn \
       --arg app "bt-cloudwaf" \
@@ -6847,7 +6863,7 @@ pack_hybrid_hostside() {
       --argjson ip_rewrite_files '["/www/cloud_waf/console/config/serverip.json","/www/cloud_waf/console/data/iplist.txt"]' \
       --arg port_file "/www/cloud_waf/console/data/.server-port" \
       --arg admin_path_file "/www/cloud_waf/console/config/sysconfig.json" \
-      '{app:$app,init:$init,start_arg:$start_arg,units:$units,process_patterns:$process_patterns,deps:$deps,ip_rewrite_files:$ip_rewrite_files,port_file:$port_file,admin_path_file:$admin_path_file}')"
+      '{app:$app,init:$init,start_arg:$start_arg,units:$units,process_patterns:$process_patterns,deps:$deps,ip_rewrite_files:$ip_rewrite_files,port_file:$port_file,admin_path_file:$admin_path_file} | [.]')"
   fi
   return 0
 }

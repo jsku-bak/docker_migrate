@@ -10,6 +10,8 @@
 
 ### Bug fixes
 
+- Fix hybrid (bt-cloudwaf) restores being rejected with `迁移包 manifest 结构或路径不安全，拒绝恢复` right after a successful download, decrypt, and integrity check. Backup wrote `hostside.services` in `manifest.json` as a single JSON object, but the restore-side validator (`restore_manifest_is_safe`) and the `[G]` management-plane startup stage both iterate it as an array, so every hybrid bundle failed the manifest gate. The validator now accepts both the legacy single-object form and the array form, `[G]` normalizes the entry to an array before iterating, and backup writes the canonical array form. Existing 2.3.0 bundles do not need to be re-packed — re-running the restore with the fixed script against the preserved diagnostic bundle is enough.
+
 - Fix `docker: Error response from daemon: invalid mode: ro,ro` when recreating containers whose bind mounts are read-only (e.g. `-v /etc/localtime:/etc/localtime:ro`). `Mounts[].Mode` already carries `ro` for such mounts and the generator appended another `ro` based on `RW=false`, producing an invalid doubled mode. The `ro` flag is now appended only when not already present in the mount options.
 
 - Stop failing bind restores whose host path is a symlink, most notably `/etc/localtime -> /usr/share/zoneinfo/…` when a container mounts `-v /etc/localtime:/etc/localtime`. The archive preserves the link, and the restore used to reject any symlink bind root over a (too conservative) ambiguity concern; absolute links keep their meaning when moved out of staging, so they now pass through, and relative links are lexically rewritten to an absolute target first. Symlink roots carry no file content, so the tree-escape check does not apply to them.
