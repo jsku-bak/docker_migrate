@@ -4574,7 +4574,6 @@ DM_SHARED_LAYERS_DIR=""
 declare -A DM_SHARED_LAYER_TAR=()
 declare -A DM_SHARED_DELETIONS=()
 declare -A DM_SHARED_GROUP_MEMBER=()
-declare -A DM_ORIG_IMAGE_SHARED=()
 if [[ -f images.tar ]] && compgen -G 'meta/*.inspect.json' >/dev/null &&
   [[ "$(tar --help 2>&1 || true)" == *--delete* ]]; then
   declare -A DM_GROUP_MEMBERS=()
@@ -4591,7 +4590,6 @@ if [[ -f images.tar ]] && compgen -G 'meta/*.inspect.json' >/dev/null &&
     dm_cname="${dm_cname%.inspect.json}"
     dm_created="$(jq -r '.[0].Created // empty' "$dm_meta" 2>/dev/null || true)"
     DM_GROUP_MEMBERS["$dm_orig"]+="${dm_created:-9999-12-31}"$'\t'"${dm_cname}"$'\t'"${dm_snap}"$'\n'
-    DM_ORIG_IMAGE_SHARED["$dm_cname"]=1
   done
   if ((${#DM_GROUP_MEMBERS[@]} > 0)); then
     DM_SHARED_LAYERS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/dm-shared-layers.XXXXXX")"
@@ -6759,7 +6757,7 @@ archive_hostside_path_to_gzip() {
   local source="$1" output="$2" rc=0
   rm -f -- "$output"
   if tar -C / ${HOSTSIDE_TAR_EXCLUDES[@]+"${HOSTSIDE_TAR_EXCLUDES[@]}"} \
-      -cf - "${source#/}" | gzip_compress_stream >"$output"; then
+    -cf - "${source#/}" | gzip_compress_stream >"$output"; then
     return 0
   else
     rc=$?
@@ -6794,7 +6792,10 @@ pack_hybrid_hostside() {
   # 检测：选中的容器里有宝塔云WAF 数据面容器，且宿主机存在管理组件
   for cname in ${CONTAINER_NAME[@]+"${CONTAINER_NAME[@]}"}; do
     case "$cname" in
-      cloudwaf_*) detected=1; break ;;
+      cloudwaf_*)
+        detected=1
+        break
+        ;;
     esac
   done
   ((detected == 1)) || return 0
@@ -6809,7 +6810,7 @@ pack_hybrid_hostside() {
   if pgrep -f "${app_root}/console/CloudWaf" >/dev/null 2>&1; then
     HOSTSIDE_PANEL_WAS_RUNNING=1
     if [[ -x /etc/init.d/btw ]]; then
-      /etc/init.d/btw admin_stop >/dev/null 2>&1 || \
+      /etc/init.d/btw admin_stop >/dev/null 2>&1 ||
         pkill -f "${app_root}/console/CloudWaf" >/dev/null 2>&1 || true
     else
       pkill -f "${app_root}/console/CloudWaf" >/dev/null 2>&1 || true
@@ -7049,7 +7050,7 @@ generate_manifest_and_restore() {
   # 混合架构宿主机组件（宝塔云WAF 等）：无组件时保持 {}，恢复端自动跳过
   local hostside_json='{}'
   if ((${#MAN_HOSTSIDE_PATHS[@]})); then
-    hostside_json="$(printf '%s\n' "${MAN_HOSTSIDE_PATHS[@]}" | \
+    hostside_json="$(printf '%s\n' "${MAN_HOSTSIDE_PATHS[@]}" |
       jq -cs --argjson services "${MAN_HOSTSIDE_SERVICES:-[]}" '{paths:.,services:$services}')"
   fi
 
