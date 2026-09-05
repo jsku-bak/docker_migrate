@@ -46,7 +46,7 @@ fi
 set -euo pipefail
 umask 077
 
-SCRIPT_VERSION="2.3.3"
+SCRIPT_VERSION="2.3.4"
 BUNDLE_ENCRYPTION_SCHEME="aes-256-ctr-hmac-sha256-v1"
 declare -a IDS=()
 declare -a RUNS=()
@@ -3383,6 +3383,159 @@ hostside_prev_restart() {
   return 0
 }
 
+# 端口冲突预检：恢复的容器要绑定宿主机端口——bridge 端口映射、host 网络
+# 容器实际监听的端口（如宝塔云WAF 的 nginx 直接占用宿主机 80/443）、混合
+# 架构管理面板端口。若目标机上其它容器或进程已占用同端口，恢复会在末段
+# （[F] 容器启动 / [G] 管理面）失败并整体回滚，数小时工作毁于最后几秒。
+# 在事务建立后立即检测：bridge 端口从容器元数据取，host 网络端口取自
+# 2.3.4+ 打包记录的 DmHostListenPorts（旧包退化为 80/443 启发式检查），
+# 面板端口取自 manifest 的 admin_port。
+#
+# 处理方式（RESTORE_PORT_CONFLICT 环境变量或交互选择）：
+#   stop   自动停止占用端口的容器（记录在案，恢复失败回滚时自动重启）
+#   fail   检测到无法解决的冲突即终止（安全回滚）
+#   ignore 仅警告并继续（非交互默认，兼容旧行为）
+#   未设置且为交互终端时弹菜单询问
+port_conflict_scan() {
+  PC_CONFLICTS=()
+  PC_CONFLICT_CONTAINERS=()
+  local -a pc_want=() pc_target_names=()
+  local pc_m pc_cname pc_hport pc_port pc_usage pc_line pc_holder pc_skip pc_tn
+
+  for pc_m in meta/*.inspect.json; do
+    [[ -f "$pc_m" ]] || continue
+    pc_cname="$(jq -r '.[0].Name | ltrimstr("/")' "$pc_m" 2>/dev/null || true)"
+    pc_cname="${pc_cname%$'\r'}"
+    [[ -n "$pc_cname" && "$pc_cname" != "null" ]] || continue
+    pc_target_names+=("$pc_cname")
+    # bridge 端口映射（运行时声明 + 静态声明）
+    while IFS= read -r pc_hport; do
+      pc_hport="${pc_hport%$'\r'}"
+      [[ -n "$pc_hport" && "$pc_hport" != "null" ]] || continue
+      pc_want+=("${pc_hport}|容器 ${pc_cname} 端口映射")
+    done < <(jq -r '.[0] | [(.NetworkSettings.Ports // {}), (.HostConfig.PortBindings // {})]
+      | .[] | to_entries[]? | .value[]? | .HostPort // empty | select(. != "")' \
+      "$pc_m" 2>/dev/null)
+    # host 网络容器实际监听端口（2.3.4+ 迁移包记录）
+    while IFS= read -r pc_hport; do
+      pc_hport="${pc_hport%$'\r'}"
+      [[ -n "$pc_hport" && "$pc_hport" != "null" ]] || continue
+      pc_want+=("${pc_hport}|容器 ${pc_cname}（host 网络）监听")
+    done < <(jq -r '.[0].DmHostListenPorts[]?' "$pc_m" 2>/dev/null)
+    # 旧包（<2.3.4）没有 host 端口清单：按 Web 常用端口做启发式检查
+    if jq -e '.[0].HostConfig.NetworkMode == "host" and
+      ((.[0].DmHostListenPorts // null) == null)' \
+      "$pc_m" >/dev/null 2>&1; then
+      for pc_port in 80 443; do
+        pc_want+=("${pc_port}|容器 ${pc_cname}（host 网络，旧包未记录端口）常用 Web 端口")
+      done
+    fi
+  done
+
+  # 混合架构管理面板端口
+  while IFS= read -r pc_hport; do
+    pc_hport="${pc_hport%$'\r'}"
+    [[ -n "$pc_hport" && "$pc_hport" != "null" ]] || continue
+    pc_want+=("${pc_hport}|混合架构管理面板监听")
+  done < <(jq -r '.hostside.services[]? | .admin_port? // empty' \
+    manifest.json 2>/dev/null)
+
+  ((${#pc_want[@]} > 0)) || return 0
+  command -v ss >/dev/null 2>&1 || return 0
+
+  for pc_entry in "${pc_want[@]}"; do
+    pc_port="${pc_entry%%|*}"
+    pc_usage="${pc_entry#*|}"
+    pc_line="$(ss -lntp 2>/dev/null | awk 'NR>1 && $4 ~ (":" p "$") {print; exit}' p="$pc_port")"
+    [[ -n "$pc_line" ]] || continue
+    pc_holder=""
+    if grep -q docker-proxy <<<"$pc_line"; then
+      pc_holder="$(docker ps --format '{{.Names}} {{.Ports}}' 2>/dev/null |
+        awk -v p=":${pc_port}->" 'index($0, p) {print $1; exit}')"
+      [[ -n "$pc_holder" ]] || pc_holder="docker 容器（未识别名称）"
+      # RESTORE_EXISTING=skip 场景：同名旧容器保留运行，其端口占用不算冲突
+      pc_skip=0
+      for pc_tn in ${pc_target_names[@]+"${pc_target_names[@]}"}; do
+        [[ "$pc_tn" == "$pc_holder" ]] && pc_skip=1
+      done
+      ((pc_skip == 1)) && continue
+      PC_CONFLICT_CONTAINERS+=("$pc_holder")
+      pc_holder="容器 ${pc_holder}"
+    else
+      pc_holder="$(grep -oE 'users:\(\(.*\)\)' <<<"$pc_line" | head -1)"
+      [[ -n "$pc_holder" ]] || pc_holder="未知进程"
+    fi
+    PC_CONFLICTS+=("端口 ${pc_port}/tcp 已被 ${pc_holder} 占用（本次恢复：${pc_usage}）")
+  done
+  return 0
+}
+
+port_conflict_precheck() {
+  local pc_mode="${RESTORE_PORT_CONFLICT:-}"
+  local pc_choice pc_ctn
+  while :; do
+    port_conflict_scan
+    ((${#PC_CONFLICTS[@]} == 0)) && return 0
+    warn "[端口冲突] 恢复需要的端口已被目标机现有服务占用："
+    local pc_c
+    for pc_c in "${PC_CONFLICTS[@]}"; do
+      warn " ⚠ ${pc_c}"
+    done
+    case "$pc_mode" in
+      stop | fail | ignore) break ;;
+    esac
+    if [[ -t 0 ]]; then
+      echo "处理方式："
+      echo " 1) 停止占用端口的容器（恢复失败回滚时会自动重启它们）"
+      echo " 2) 我已手动处理，重新检测"
+      echo " 3) 忽略冲突，继续恢复（可能在容器启动/管理面阶段失败）"
+      printf '请选择 [1-3]：'
+      IFS= read -r pc_choice || pc_choice=3
+      case "$pc_choice" in
+        1) pc_mode="stop" ;;
+        2) warn " 已手动处理，重新检测端口占用 ..." ;;
+        3) pc_mode="ignore" ;;
+        *) continue ;;
+      esac
+      [[ "$pc_mode" == "stop" || "$pc_mode" == "ignore" ]] && break
+    else
+      pc_mode="ignore"
+      break
+    fi
+  done
+
+  case "$pc_mode" in
+    fail)
+      RED "[ERR] 端口冲突未能解决（RESTORE_PORT_CONFLICT=fail），终止本次恢复。"
+      return 1
+      ;;
+    stop)
+      for pc_ctn in ${PC_CONFLICT_CONTAINERS[@]+"${PC_CONFLICT_CONTAINERS[@]}"}; do
+        if docker stop "$pc_ctn" >/dev/null 2>&1; then
+          echo "$pc_ctn" >>"${RESTORE_TRANSACTION_DIR}/port_conflict_stopped.txt"
+          say " - 已停止容器 ${pc_ctn}（恢复失败回滚时会自动重启）"
+        else
+          warn " 容器 ${pc_ctn} 停止失败，请人工处理（端口冲突可能导致恢复失败）"
+        fi
+      done
+      port_conflict_scan
+      if ((${#PC_CONFLICTS[@]} > 0)); then
+        warn " 停止容器后仍有端口被宿主机进程占用："
+        for pc_c in "${PC_CONFLICTS[@]}"; do
+          warn " ⚠ ${pc_c}"
+        done
+        warn " 请人工处理上述进程后重试恢复（已停止的容器不会自动恢复运行）。"
+        return 1
+      fi
+      ;;
+    ignore | *)
+      warn " 按当前设置忽略端口冲突继续恢复；若后续容器启动/管理面失败，"
+      warn " 优先排查上述端口的占用情况（可用 ss -lntp 定位）。"
+      ;;
+  esac
+  return 0
+}
+
 # 面板配置 IP 改写：配置文件里记录的是源服务器公网 IP（serverip.json、
 # iplist.txt），不改写会导致面板拒绝在新服务器上监听/访问。只替换每个
 # 文件中第一个出现的 IP（即源端服务器 IP），避免误伤其它内容。
@@ -4299,6 +4452,16 @@ transaction_rollback() {
       say "[进度] 自动回滚：重启旧管理面面板"
       hostside_prev_restart
     fi
+
+    # 端口冲突预检中自动停止的第三方容器重新拉起（它们与旧服务无关，
+    # 只是挡了恢复端口的道；恢复回滚后应回到原样）。
+    if [[ -f "${RESTORE_TRANSACTION_DIR}/port_conflict_stopped.txt" ]]; then
+      say "[进度] 自动回滚：重启被端口预检停止的容器"
+      while IFS= read -r pc_ctn; do
+        [[ -n "$pc_ctn" ]] || continue
+        docker start "$pc_ctn" >/dev/null 2>&1 || true
+      done <"${RESTORE_TRANSACTION_DIR}/port_conflict_stopped.txt"
+    fi
   else
     rc=1
     data_ok=0
@@ -5054,6 +5217,15 @@ if jq -e '.hostside.paths|length>0' manifest.json >/dev/null 2>&1; then
   fi
 fi
 
+# 端口冲突预检：目标机其它容器/进程占用本次恢复所需端口（bridge 映射、
+# host 网络监听端口、面板端口）时提前发现并处理，避免数小时恢复在末段
+# 失败回滚。交互模式弹菜单，可用 RESTORE_PORT_CONFLICT=stop/fail/ignore
+# 预设处理方式。
+if ! port_conflict_precheck; then
+  RED "[ERR] 端口冲突未能解决，终止本次恢复（已安全回滚）。"
+  exit 1
+fi
+
 # [B0] 混合架构宿主机组件（如宝塔云WAF 管理面）：必须在容器 bind 恢复
 # （[C]）之前就位——容器挂载的应用子目录（/www/cloud_waf/nginx 等）要
 # 落在宿主机组件铺好的目录树里；组件归档与 binds 同格式，直接复用
@@ -5467,6 +5639,12 @@ if jq -e 'length>0' <<<"$hs_services" >/dev/null 2>&1; then
       warn " 排查：${hs_init} status；面板日志 /www/cloud_waf/console/logs/error.log"
     else
       warn " 管理面未能就绪（端口 ${hs_port} 未监听）"
+      # 自动显示常见冲突端口的占用者（host 网络数据面用 80/443，面板用
+      # hs_port）：端口被目标机其它容器/进程占用是本阶段最常见根因。
+      command -v ss >/dev/null 2>&1 && while IFS= read -r pc_line; do
+        warn " ⚠ 端口占用：${pc_line}"
+      done < <(ss -lntp 2>/dev/null |
+        awk 'NR>1 && ($4 ~ (":" a "$") || $4 ~ ":80$" || $4 ~ ":443$")' a="$hs_port")
       warn " 排查：${hs_init} status；端口占用 ss -lntp | grep ${hs_port}；面板日志 /www/cloud_waf/console/logs/error.log"
       FAILED_HOSTSIDE+=("$hs_app")
     fi
@@ -6603,6 +6781,30 @@ for id in "${IDS[@]}"; do
     case "$n" in bridge | host | none) : ;; *) NETWORKS["$n"]=1 ;; esac
   done
 
+  # host 网络容器的监听端口不体现在 PortBindings 里（如宝塔云WAF 的
+  # cloudwaf_nginx 直接绑定宿主机 80/443）。趁容器仍运行，把它实际监听的
+  # 宿主机端口写入 DmHostListenPorts，恢复端据此在恢复前做端口冲突预检
+  # （目标机其它容器/进程已占用同端口时提前发现，而不是迁移几小时后在
+  # 容器启动/管理面阶段失败回滚）。
+  if jq -e '.[0].HostConfig.NetworkMode == "host" and .[0].State.Running' \
+    <<<"$j" >/dev/null 2>&1; then
+    dm_host_ports=""
+    if command -v ss >/dev/null 2>&1; then
+      dm_pat="$(docker top "$id" -eo pid 2>/dev/null |
+        awk 'NR>1 {printf "%spid=%s[,\"]", sep, $1; sep="|"}')"
+      if [[ -n "$dm_pat" ]]; then
+        dm_host_ports="$(ss -lntp 2>/dev/null | awk 'NR>1' |
+          grep -E "$dm_pat" |
+          awk '{n=split($4,a,":"); if (a[n] ~ /^[0-9]+$/) print a[n]}' |
+          sort -un | paste -sd, -)"
+      fi
+    fi
+    if [[ -n "$dm_host_ports" ]]; then
+      j="$(jq --arg hp "$dm_host_ports" \
+        '.[0].DmHostListenPorts = ($hp | split(",") | map(tonumber))' <<<"$j")"
+    fi
+  fi
+
   echo "$j" >"${BUNDLE}/meta/${name}.inspect.json"
 done
 
@@ -7071,6 +7273,15 @@ pack_hybrid_hostside() {
   #    services 必须是数组（恢复端按数组迭代校验与消费）；2.3.0 曾误写成
   #    单个对象，导致恢复端整体拒绝迁移包（新版恢复端已兼容两种形态）。
   if [[ -f /etc/init.d/btw ]]; then
+    # 面板端口值在源机读取后一并记录（admin_port），恢复端在 [B0] 落地
+    # port_file 之前就能做端口冲突预检。
+    dm_admin_port="$(tr -d '[:space:]' </www/cloud_waf/console/data/.server-port 2>/dev/null || true)"
+    dm_admin_port_args=()
+    if [[ "$dm_admin_port" =~ ^[0-9]+$ ]]; then
+      dm_admin_port_args=(--argjson admin_port "$dm_admin_port")
+    else
+      dm_admin_port_args=(--argjson admin_port null)
+    fi
     MAN_HOSTSIDE_SERVICES="$(jq -cn \
       --arg app "bt-cloudwaf" \
       --arg init "/etc/init.d/btw" \
@@ -7081,7 +7292,8 @@ pack_hybrid_hostside() {
       --argjson ip_rewrite_files '["/www/cloud_waf/console/config/serverip.json","/www/cloud_waf/console/data/iplist.txt"]' \
       --arg port_file "/www/cloud_waf/console/data/.server-port" \
       --arg admin_path_file "/www/cloud_waf/console/config/sysconfig.json" \
-      '{app:$app,init:$init,start_arg:$start_arg,units:$units,process_patterns:$process_patterns,deps:$deps,ip_rewrite_files:$ip_rewrite_files,port_file:$port_file,admin_path_file:$admin_path_file} | [.]')"
+      "${dm_admin_port_args[@]}" \
+      '{app:$app,init:$init,start_arg:$start_arg,units:$units,process_patterns:$process_patterns,deps:$deps,ip_rewrite_files:$ip_rewrite_files,port_file:$port_file,admin_path_file:$admin_path_file,admin_port:$admin_port} | [.]')"
   fi
   return 0
 }

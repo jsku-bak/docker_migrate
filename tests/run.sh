@@ -1179,6 +1179,242 @@ SH
   grep -q 'init start' "${tmp}/calls.log"
 }
 
+# ---- 端口冲突预检 ----
+
+# 生成端口预检所需的 bundle 骨架：meta/<name>.inspect.json + manifest.json。
+# 参数：容器名、inspect JSON（压缩单行）、manifest services JSON（可空）。
+write_port_conflict_bundle() {
+  local dir="$1" cname="$2" inspect_json="$3" services_json="${4:-null}"
+  mkdir -p "${dir}/meta"
+  printf '%s\n' "$inspect_json" >"${dir}/meta/${cname}.inspect.json"
+  printf '{"hostside":{"services":%s}}\n' "$services_json" >"${dir}/manifest.json"
+}
+
+# 公共 mock：ss/docker。
+# $PC_SS_LINES 写入 mock ss 的 LISTEN 行；docker ps/stop/start 记录到 $PC_LOG。
+write_port_conflict_mocks() {
+  local dir="$1"
+  mkdir -p "${dir}/bin"
+  cat >"${dir}/bin/ss" <<'SH'
+#!/bin/sh
+[ "$1" = "-lntp" ] || exit 0
+printf 'State  Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n'
+cat "$PC_SS_LINES"
+SH
+  cat >"${dir}/bin/docker" <<'SH'
+#!/bin/sh
+case "$1 $2" in
+  'ps --format')
+    cat "$PC_DOCKER_PS"
+    ;;
+  'stop '*)
+    printf 'docker stop %s\n' "$2" >>"$PC_LOG"
+    # 模拟端口随容器停止而释放，供 stop 模式复查
+    : >"$PC_SS_LINES"
+    exit 0
+    ;;
+  'start '*)
+    printf 'docker start %s\n' "$2" >>"$PC_LOG"
+    exit 0
+    ;;
+esac
+exit 0
+SH
+  chmod +x "${dir}/bin/ss" "${dir}/bin/docker"
+  : >"${dir}/pc-ss.txt"
+  : >"${dir}/pc-docker-ps.txt"
+  : >"${dir}/pc.log"
+  printf '%s\n' "${dir}/pc-ss.txt" "${dir}/pc-docker-ps.txt" "${dir}/pc.log" >/dev/null
+}
+
+source_port_conflict_functions() {
+  local tmp="$1"
+  write_bundle_restore_script "${tmp}/restore.sh"
+  trap - RETURN
+  # shellcheck disable=SC1090
+  source <(sed -n -e '/^port_conflict_scan() {/,/^}/p' \
+    -e '/^port_conflict_precheck() {/,/^}/p' "${tmp}/restore.sh")
+  # 注意：不要在此重设 RETURN trap——本函数返回时会立即触发并删除 $tmp。
+  # 调用方在调用本函数后自行重设。
+}
+
+test_port_conflict_scan_names_occupying_container() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"host","PortBindings":{}},"NetworkSettings":{"Ports":{}},"DmHostListenPorts":[80,443]}]' \
+    '[{"admin_port":8379}]'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  cat >"${tmp}/pc-ss.txt" <<'SS'
+LISTEN 0      4096   0.0.0.0:80         0.0.0.0:*    users:(("docker-proxy",pid=872107,fd=4))
+LISTEN 0      4096   0.0.0.0:443        0.0.0.0:*    users:(("docker-proxy",pid=872093,fd=4))
+SS
+  printf 'traefik 0.0.0.0:80->80/tcp,0.0.0.0:443->443/tcp\n' >"${tmp}/pc-docker-ps.txt"
+
+  (
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    port_conflict_scan
+    ((${#PC_CONFLICTS[@]} == 2))
+    grep -q '端口 80/tcp 已被 容器 traefik 占用' <<<"${PC_CONFLICTS[0]}"
+    grep -q '端口 443/tcp 已被 容器 traefik 占用' <<<"${PC_CONFLICTS[1]}"
+    ((${#PC_CONFLICT_CONTAINERS[@]} == 2))
+    [[ "${PC_CONFLICT_CONTAINERS[0]}" == "traefik" ]]
+  )
+}
+
+test_port_conflict_scan_ignores_same_name_container() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"bridge","PortBindings":{"80/tcp":[{"HostIp":"","HostPort":"8080"}]}},"NetworkSettings":{"Ports":{}}}]' \
+    'null'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  cat >"${tmp}/pc-ss.txt" <<'SS'
+LISTEN 0      4096   0.0.0.0:8080       0.0.0.0:*    users:(("docker-proxy",pid=101,fd=4))
+SS
+  printf 'web1 0.0.0.0:8080->80/tcp\n' >"${tmp}/pc-docker-ps.txt"
+
+  (
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    port_conflict_scan
+    ((${#PC_CONFLICTS[@]} == 0))
+    ((${#PC_CONFLICT_CONTAINERS[@]} == 0))
+  )
+}
+
+test_port_conflict_scan_old_bundle_falls_back_to_web_ports() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"host","PortBindings":{}},"NetworkSettings":{"Ports":{}}}]' \
+    'null'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  cat >"${tmp}/pc-ss.txt" <<'SS'
+LISTEN 0      4096   0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=42,fd=6))
+SS
+  : >"${tmp}/pc-docker-ps.txt"
+
+  (
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    cd "$tmp"
+    port_conflict_scan
+    ((${#PC_CONFLICTS[@]} == 1))
+    grep -q '端口 80/tcp 已被 users' <<<"${PC_CONFLICTS[0]}"
+  )
+}
+
+test_port_conflict_precheck_stop_mode_stops_and_records() {
+  local tmp
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/txn"
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"host","PortBindings":{}},"NetworkSettings":{"Ports":{}},"DmHostListenPorts":[80]}]' \
+    'null'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  cat >"${tmp}/pc-ss.txt" <<'SS'
+LISTEN 0      4096   0.0.0.0:80         0.0.0.0:*    users:(("docker-proxy",pid=872107,fd=4))
+SS
+  printf 'traefik 0.0.0.0:80->80/tcp\n' >"${tmp}/pc-docker-ps.txt"
+
+  (
+    say() { :; }
+    warn() { :; }
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    export RESTORE_PORT_CONFLICT=stop RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    cd "$tmp"
+    port_conflict_precheck
+  )
+  grep -q 'docker stop traefik' "${tmp}/pc.log"
+  grep -q '^traefik$' "${tmp}/txn/port_conflict_stopped.txt"
+}
+
+test_port_conflict_precheck_fail_mode_aborts() {
+  local tmp rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/txn"
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"host","PortBindings":{}},"NetworkSettings":{"Ports":{}},"DmHostListenPorts":[80]}]' \
+    'null'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  cat >"${tmp}/pc-ss.txt" <<'SS'
+LISTEN 0      4096   0.0.0.0:80         0.0.0.0:*    users:(("nginx",pid=42,fd=6))
+SS
+  : >"${tmp}/pc-docker-ps.txt"
+
+  set +e
+  (
+    say() { :; }
+    warn() { :; }
+    RED() { :; }
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    export RESTORE_PORT_CONFLICT=fail RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    cd "$tmp"
+    port_conflict_precheck
+  )
+  rc=$?
+  set -e
+  [[ "$rc" -eq 1 ]]
+  [[ ! -e "${tmp}/txn/port_conflict_stopped.txt" ]]
+}
+
+test_port_conflict_precheck_passes_without_conflict() {
+  local tmp rc
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+  mkdir -p "${tmp}/txn"
+  write_port_conflict_bundle "$tmp" web1 \
+    '[{"Name":"/web1","HostConfig":{"NetworkMode":"host","PortBindings":{}},"NetworkSettings":{"Ports":{}},"DmHostListenPorts":[80]}]' \
+    'null'
+  write_port_conflict_mocks "$tmp"
+  source_port_conflict_functions "$tmp"
+  trap 'rm -rf "$tmp"' RETURN
+  : >"${tmp}/pc-ss.txt"
+  : >"${tmp}/pc-docker-ps.txt"
+
+  set +e
+  (
+    say() { :; }
+    warn() { :; }
+    export PC_SS_LINES="${tmp}/pc-ss.txt" PC_DOCKER_PS="${tmp}/pc-docker-ps.txt" \
+      PC_LOG="${tmp}/pc.log"
+    export PATH="${tmp}/bin:$PATH"
+    export RESTORE_PORT_CONFLICT=stop RESTORE_TRANSACTION_DIR="${tmp}/txn"
+    cd "$tmp"
+    port_conflict_precheck
+  )
+  rc=$?
+  set -e
+  [[ "$rc" -eq 0 ]]
+  [[ ! -s "${tmp}/pc.log" ]]
+}
+
 run_test "docker image save failure status is preserved" test_progress_propagates_failure
 run_test "plain activity progress preserves failure status" test_activity_progress_plain_failure_contract
 run_test "progress percentages are shown only for known totals" test_progress_render_reports_only_real_percentages
@@ -1220,6 +1456,12 @@ run_test "hostside quiesce is a no-op when no panel is running" test_hostside_qu
 run_test "hostside quiesce refuses to continue when the panel survives kills" test_hostside_quiesce_fails_when_process_survives
 run_test "hostside rollback restart prefers the systemd unit" test_hostside_prev_restart_prefers_systemd_unit
 run_test "hostside rollback restart falls back to the init script" test_hostside_prev_restart_falls_back_to_init
+run_test "port conflict scan names the occupying container" test_port_conflict_scan_names_occupying_container
+run_test "port conflict scan ignores the same-name existing container" test_port_conflict_scan_ignores_same_name_container
+run_test "port conflict scan falls back to web ports for old bundles" test_port_conflict_scan_old_bundle_falls_back_to_web_ports
+run_test "port conflict precheck stop mode stops and records containers" test_port_conflict_precheck_stop_mode_stops_and_records
+run_test "port conflict precheck fail mode aborts the restore" test_port_conflict_precheck_fail_mode_aborts
+run_test "port conflict precheck passes when no conflict exists" test_port_conflict_precheck_passes_without_conflict
 
 printf '\nTests: %d passed, %d failed\n' "$PASS_COUNT" "$FAIL_COUNT"
 ((FAIL_COUNT == 0))
